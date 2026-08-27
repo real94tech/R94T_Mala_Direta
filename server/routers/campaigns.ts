@@ -17,9 +17,17 @@ async function getTransporter(userId: number) {
       auth: { user: smtp.username, pass: smtp.password },
       tls: smtp.encryption === "tls" ? { rejectUnauthorized: false } : undefined,
     }),
-    fromEmail: smtp.fromEmail,
-    fromName: smtp.fromName || "Mala Direta",
+    smtp,
   };
+}
+
+function resolveSender(
+  campaign: { senderEmail?: string | null; senderName?: string | null },
+  smtp: { fromEmail: string; fromName?: string | null }
+) {
+  const fromEmail = campaign.senderEmail?.trim() || smtp.fromEmail;
+  const fromName = campaign.senderName?.trim() || smtp.fromName?.trim() || "Mala Direta";
+  return { fromEmail, fromName };
 }
 
 export const campaignsRouter = router({
@@ -257,7 +265,8 @@ export const campaignsRouter = router({
         throw new TRPCError({ code: "BAD_REQUEST", message: "Seu perfil não possui e-mail cadastrado" });
       }
 
-      const { transporter, fromEmail, fromName } = await getTransporter(ctx.user.id);
+      const { transporter, smtp } = await getTransporter(ctx.user.id);
+      const { fromEmail, fromName } = resolveSender(campaign, smtp);
       const attachments = await db.getCampaignAttachments(input.campaignId);
 
       let htmlBody = campaign.htmlContent || "";
@@ -327,7 +336,8 @@ export const campaignsRouter = router({
       // Send emails asynchronously
       (async () => {
         try {
-          const { transporter, fromEmail, fromName } = await getTransporter(ctx.user.id);
+          const { transporter, smtp } = await getTransporter(ctx.user.id);
+          const { fromEmail, fromName } = resolveSender(campaign, smtp);
           const attachments = await db.getCampaignAttachments(input.campaignId);
 
           let htmlBody = campaign.htmlContent || "";

@@ -9,6 +9,33 @@ const XANO_BASE_URL = process.env.XANO_API_BASE_URL || 'https://xd23-clr8-wwle.b
 
 export async function getDb() { return null; }
 
+type LocalUserRecord = {
+  id: number;
+  openId: string;
+  email: string | null;
+  name: string | null;
+  role: "user" | "admin";
+  loginMethod: string | null;
+  passwordHash?: string | null;
+  password?: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  lastSignedIn: Date;
+};
+
+const usersByOpenId = new Map<string, LocalUserRecord>();
+const openIdByEmail = new Map<string, string>();
+let nextUserId = 1;
+
+function normalizeEmail(email: string | null | undefined) {
+  const value = email?.trim().toLowerCase();
+  return value ? value : null;
+}
+
+function cloneUser(user: LocalUserRecord) {
+  return { ...user };
+}
+
 // ============ TRADUTOR UNIVERSAL ============
 function mapToApp(record: any): any {
   if (!record || typeof record !== 'object') return record;
@@ -66,13 +93,65 @@ async function xanoFetch(endpoint: string, method = 'GET', body?: any): Promise<
 }
 
 // ============ USERS ============
-export async function upsertUser(user: InsertUser): Promise<void> { return; }
+export async function upsertUser(user: InsertUser): Promise<void> {
+  if (!user.openId) return;
+
+  const email = normalizeEmail(user.email);
+  const now = new Date();
+  const existingOpenId = usersByOpenId.get(user.openId);
+  const existingByEmail = email ? usersByOpenId.get(openIdByEmail.get(email) ?? "") : undefined;
+  const existing = existingOpenId ?? existingByEmail;
+
+  if (existing) {
+    const previousEmail = normalizeEmail(existing.email);
+    const updated: LocalUserRecord = {
+      ...existing,
+      email: email ?? existing.email ?? null,
+      name: user.name ?? existing.name ?? null,
+      role: (user.role as "user" | "admin" | undefined) ?? existing.role,
+      loginMethod: user.loginMethod ?? existing.loginMethod ?? null,
+      passwordHash: user.passwordHash ?? existing.passwordHash ?? null,
+      password: (user as any).password ?? existing.password ?? null,
+      updatedAt: now,
+      lastSignedIn: user.lastSignedIn ?? existing.lastSignedIn ?? now,
+      openId: user.openId,
+    };
+
+    if (previousEmail && previousEmail !== updated.email) openIdByEmail.delete(previousEmail);
+    usersByOpenId.delete(existing.openId);
+    usersByOpenId.set(updated.openId, updated);
+    if (updated.email) openIdByEmail.set(updated.email, updated.openId);
+    return;
+  }
+
+  const created: LocalUserRecord = {
+    id: nextUserId++,
+    openId: user.openId,
+    email,
+    name: user.name ?? email,
+    role: (user.role as "user" | "admin" | undefined) ?? "user",
+    loginMethod: user.loginMethod ?? null,
+    passwordHash: user.passwordHash ?? null,
+    password: (user as any).password ?? null,
+    createdAt: now,
+    updatedAt: now,
+    lastSignedIn: user.lastSignedIn ?? now,
+  };
+
+  usersByOpenId.set(created.openId, created);
+  if (created.email) openIdByEmail.set(created.email, created.openId);
+}
 export async function getUserByOpenId(openId: string) {
-  return { id: 1, openId, email: "pedro.gabriel@real94.com.br", name: "Pedro Gabriel", role: "admin", createdAt: new Date() };
+  const user = usersByOpenId.get(openId);
+  return user ? cloneUser(user) : undefined;
 }
 export async function getUserByEmail(email: string) {
-  if (email.toLowerCase() === "pedro.gabriel@real94.com.br") return { id: 1, openId: "local_pedro", email, name: "Pedro Gabriel", role: "admin" };
-  return undefined;
+  const normalized = normalizeEmail(email);
+  if (!normalized) return undefined;
+  const openId = openIdByEmail.get(normalized);
+  if (!openId) return undefined;
+  const user = usersByOpenId.get(openId);
+  return user ? cloneUser(user) : undefined;
 }
 
 // ============ CONTACT LISTS ============
