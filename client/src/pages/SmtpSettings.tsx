@@ -30,7 +30,7 @@ export default function SmtpSettings() {
         host: smtp.host || "",
         port: String(smtp.port || 587),
         username: smtp.username || "",
-        password: smtp.password || "",
+        password: "",
         encryption: (smtp.encryption as "none" | "ssl" | "tls") || "tls",
         fromEmail: smtp.fromEmail || "",
         fromName: smtp.fromName || "Real 94",
@@ -58,7 +58,7 @@ export default function SmtpSettings() {
   });
 
   const handleSave = () => {
-    if (!form.host || !form.username || !form.password || !form.fromEmail) {
+    if (!form.host || !form.username || !form.fromEmail) {
       toast.error("Preencha todos os campos obrigatórios");
       return;
     }
@@ -66,7 +66,7 @@ export default function SmtpSettings() {
       host: form.host,
       port: parseInt(form.port),
       username: form.username,
-      password: form.password,
+      ...(form.password ? { password: form.password } : {}),
       encryption: form.encryption,
       fromEmail: form.fromEmail,
       fromName: form.fromName,
@@ -116,7 +116,7 @@ export default function SmtpSettings() {
             </div>
             <div>
               <Label>Senha *</Label>
-              <Input value={form.password} onChange={(e) => setForm(f => ({ ...f, password: e.target.value }))} type="password" placeholder="••••••••" />
+              <Input value={form.password} onChange={(e) => setForm(f => ({ ...f, password: e.target.value }))} type="password" placeholder={smtp ? "Deixe vazio para manter a senha" : "Senha SMTP"} />
             </div>
           </div>
           <div>

@@ -63,6 +63,21 @@ export default function CampaignWizard() {
   );
   const utils = trpc.useUtils();
 
+  const handleTextPaste = (
+    event: React.ClipboardEvent<HTMLInputElement>,
+    setValue: React.Dispatch<React.SetStateAction<string>>,
+  ) => {
+    const pastedText = event.clipboardData.getData("text");
+    if (!pastedText) return;
+
+    // Insert the clipboard text at the cursor, including when the input is controlled.
+    event.preventDefault();
+    const input = event.currentTarget;
+    const start = input.selectionStart ?? input.value.length;
+    const end = input.selectionEnd ?? start;
+    setValue(current => current.slice(0, start) + pastedText + current.slice(end));
+  };
+
   // Load campaign data when editing
   useEffect(() => {
     if (campaign) {
@@ -452,21 +467,21 @@ export default function CampaignWizard() {
           <CardContent className="space-y-4">
             <div>
               <Label>Assunto do e-mail *</Label>
-              <Input value={subject} onChange={(e) => setSubject(e.target.value)} placeholder="Ex: Novidades da Real 94 - Março 2026" />
+              <Input value={subject} onChange={(e) => setSubject(e.target.value)} onPaste={(e) => handleTextPaste(e, setSubject)} placeholder="Ex: Novidades da Real 94 - Março 2026" />
             </div>
             <div>
               <Label>Texto de pré-visualização</Label>
-              <Input value={previewText} onChange={(e) => setPreviewText(e.target.value)} placeholder="Texto que aparece na caixa de entrada" />
+              <Input value={previewText} onChange={(e) => setPreviewText(e.target.value)} onPaste={(e) => handleTextPaste(e, setPreviewText)} placeholder="Texto que aparece na caixa de entrada" />
             </div>
             <Separator />
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <Label>Nome do remetente</Label>
-                <Input value={senderName} onChange={(e) => setSenderName(e.target.value)} placeholder="Real 94" />
+                <Input value={senderName} onChange={(e) => setSenderName(e.target.value)} onPaste={(e) => handleTextPaste(e, setSenderName)} placeholder="Real 94" />
               </div>
               <div>
                 <Label>E-mail do remetente</Label>
-                <Input value={senderEmail} onChange={(e) => setSenderEmail(e.target.value)} placeholder="contato@real94.com.br" type="email" />
+                <Input value={senderEmail} onChange={(e) => setSenderEmail(e.target.value)} onPaste={(e) => handleTextPaste(e, setSenderEmail)} placeholder="contato@real94.com.br" type="email" />
               </div>
             </div>
             <div className="flex justify-between">

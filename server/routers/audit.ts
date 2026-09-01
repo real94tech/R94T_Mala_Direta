@@ -27,13 +27,23 @@ export const smtpRouter = router({
       host: z.string().min(1),
       port: z.number().min(1).max(65535),
       username: z.string().min(1),
-      password: z.string().min(1),
+      password: z.string().optional(),
       encryption: z.enum(["tls", "ssl", "none"]),
       fromEmail: z.string().email(),
       fromName: z.string().optional(),
     }))
     .mutation(async ({ ctx, input }) => {
-      const result = await db.upsertSmtpSettings(ctx.user.id, input);
+      const current = await db.getSmtpSettings(ctx.user.id);
+      const newPassword = input.password?.trim();
+      const password = newPassword && newPassword !== "••••••••"
+        ? newPassword
+        : current?.password;
+
+      if (!password) {
+        throw new Error("Informe a senha SMTP.");
+      }
+
+      const result = await db.upsertSmtpSettings(ctx.user.id, { ...input, password });
       await db.createAuditLog({
         userId: ctx.user.id,
         action: "update",
