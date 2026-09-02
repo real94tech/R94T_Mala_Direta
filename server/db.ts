@@ -314,9 +314,22 @@ export async function getContactListsForContact(contactId: number) {
 export async function getListContacts(listId: number) {
   const members = await xanoFetch(`/mkt_contact_list_members?list_id=${listId}`);
   if (!Array.isArray(members) || members.length === 0) return [];
-  const contactIds = members.map((m: any) => m.contact_id);
+
+  // Endpoints genéricos do Xano podem ignorar query params e devolver todos os
+  // vínculos. Reaplicamos o filtro antes de montar os destinatários da campanha.
+  const contactIds = new Set(
+    members
+      .filter((member: any) => Number(member.list_id) === listId)
+      .map((member: any) => Number(member.contact_id))
+  );
+  if (contactIds.size === 0) return [];
+
   const allContacts = await xanoFetch('/mkt_contacts');
-  return Array.isArray(allContacts) ? allContacts.filter((c: any) => contactIds.includes(c.id) && c.subscribed).map(mapToApp) : [];
+  return Array.isArray(allContacts)
+    ? allContacts
+        .filter((contact: any) => contactIds.has(Number(contact.id)) && contact.subscribed)
+        .map(mapToApp)
+    : [];
 }
 
 // ============ CAMPAIGNS ============
