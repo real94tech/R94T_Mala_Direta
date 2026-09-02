@@ -16,6 +16,9 @@ import * as db from "../db";
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function getSessionSecret() {
+  if (!ENV.cookieSecret && process.env.NODE_ENV === "production") {
+    throw new Error("JWT_SECRET não configurado.");
+  }
   return new TextEncoder().encode(ENV.cookieSecret || "local-dev-secret-change-me");
 }
 
@@ -124,9 +127,9 @@ export function registerLocalAuthRoutes(app: Express) {
    */
   app.post("/api/auth/register", async (req: Request, res: Response) => {
     const { email, password, name, adminSecret } = req.body ?? {};
-    const expectedSecret = process.env.LOCAL_ADMIN_SECRET || "real94-admin-2026";
+    const expectedSecret = process.env.LOCAL_ADMIN_SECRET;
 
-    if (adminSecret !== expectedSecret) {
+    if (!expectedSecret || adminSecret !== expectedSecret) {
       res.status(403).json({ error: "Segredo de administrador inválido." });
       return;
     }

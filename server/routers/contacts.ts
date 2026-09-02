@@ -218,7 +218,7 @@ export const contactsRouter = router({
         imported = results.length;
 
         if (input.listId) {
-          await db.addContactsToList(results.map(r => r.id), input.listId);
+          await db.addContactsToList(results.map(r => r.id), input.listId, ctx.user.id);
         }
       }
 
@@ -239,7 +239,7 @@ export const contactsRouter = router({
       listId: z.number(),
     }))
     .mutation(async ({ ctx, input }) => {
-      await db.addContactsToList(input.contactIds, input.listId);
+      await db.addContactsToList(input.contactIds, input.listId, ctx.user.id);
       return { success: true };
     }),
 
@@ -249,13 +249,13 @@ export const contactsRouter = router({
       listId: z.number(),
     }))
     .mutation(async ({ ctx, input }) => {
-      await db.removeContactFromList(input.contactId, input.listId);
+      await db.removeContactFromList(input.contactId, input.listId, ctx.user.id);
       return { success: true };
     }),
 
   getListsForContact: protectedProcedure
     .input(z.object({ contactId: z.number() }))
     .query(async ({ ctx, input }) => {
-      return db.getContactListsForContact(input.contactId);
+      return db.getContactListsForContact(input.contactId, ctx.user.id);
     }),
 });

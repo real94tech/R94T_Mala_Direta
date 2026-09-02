@@ -165,8 +165,7 @@ export default defineConfig({
   root: path.resolve(import.meta.dirname, "client"),
   publicDir: path.resolve(import.meta.dirname, "client", "public"),
   build: {
-    // 🎯 AQUI FOI A CORREÇÃO: apontando para a pasta que o servidor espera!
-    outDir: path.resolve(import.meta.dirname, "server/_core/public"),
+    outDir: path.resolve(import.meta.dirname, "dist/public"),
     emptyOutDir: true,
   },
   server: {

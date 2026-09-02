@@ -128,7 +128,7 @@ describe("contacts.quickImport", () => {
       listId: 5,
     });
     expect(result.imported).toBe(2);
-    expect(addContactsToList).toHaveBeenCalledWith([1, 2], 5);
+    expect(addContactsToList).toHaveBeenCalledWith([1, 2], 5, 1);
   });
 
   it("throws error for empty input", async () => {

@@ -67,7 +67,6 @@ export const smtpRouter = router({
         port: settings.port,
         secure: settings.encryption === "ssl",
         auth: { user: settings.username, pass: settings.password },
-        tls: settings.encryption === "tls" ? { rejectUnauthorized: false } : undefined,
       });
       await transporter.verify();
       return { success: true, message: "Conexão SMTP verificada com sucesso" };

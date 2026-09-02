@@ -1,13 +1,46 @@
-import { eq, and, desc, sql, like, inArray } from "drizzle-orm";
+import { createPool, type Pool } from "mysql2/promise";
 import type {
   InsertUser, ContactList, InsertContactList, Contact, InsertContact,
   Campaign, InsertCampaign, InsertAuditLog, InsertSmtpSettings
 } from "../drizzle/schema";
 
 // ============ CONFIGURAÇÃO DO XANO ============
-const XANO_BASE_URL = process.env.XANO_API_BASE_URL || 'https://xd23-clr8-wwle.b2.xano.io/api:PzghHKZc';
+const XANO_BASE_URL = process.env.XANO_API_BASE_URL?.replace(/\/$/, "") ?? "";
 
-export async function getDb() { return null; }
+let databasePool: Pool | null | undefined;
+
+function createDatabasePool() {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) return null;
+
+  const url = new URL(databaseUrl.replace(/^mysql2?:\/\//, "mysql://"));
+  const sslParam = url.searchParams.get("ssl");
+  url.searchParams.delete("ssl");
+
+  let ssl: Record<string, unknown> = { rejectUnauthorized: true };
+  if (sslParam) {
+    try {
+      ssl = JSON.parse(decodeURIComponent(sslParam));
+    } catch {
+      console.warn("[DB] DATABASE_URL contém uma configuração SSL inválida; usando validação padrão.");
+    }
+  }
+
+  return createPool({
+    host: url.hostname,
+    port: Number(url.port || 3306),
+    user: decodeURIComponent(url.username),
+    password: decodeURIComponent(url.password),
+    database: url.pathname.slice(1),
+    ssl,
+    connectionLimit: 5,
+  });
+}
+
+export async function getDb() {
+  if (databasePool === undefined) databasePool = createDatabasePool();
+  return databasePool;
+}
 
 type LocalUserRecord = {
   id: number;
@@ -98,6 +131,37 @@ export async function upsertUser(user: InsertUser): Promise<void> {
 
   const email = normalizeEmail(user.email);
   const now = new Date();
+  const pool = await getDb();
+  if (pool) {
+    const [existingRows] = await pool.execute(
+      "SELECT id FROM users WHERE openId = ? OR (? IS NOT NULL AND LOWER(email) = ?) LIMIT 1",
+      [user.openId, email, email]
+    );
+    const existingId = (existingRows as Array<{ id: number }>)[0]?.id;
+
+    if (existingId) {
+      await pool.execute(
+        `UPDATE users SET
+          openId = ?, email = COALESCE(?, email), name = COALESCE(?, name),
+          role = COALESCE(?, role), loginMethod = COALESCE(?, loginMethod),
+          passwordHash = COALESCE(?, passwordHash), updatedAt = NOW(),
+          lastSignedIn = COALESCE(?, lastSignedIn)
+         WHERE id = ?`,
+        [user.openId, email, user.name ?? null, user.role ?? null, user.loginMethod ?? null,
+          user.passwordHash ?? null, user.lastSignedIn ?? null, existingId]
+      );
+    } else {
+      await pool.execute(
+        `INSERT INTO users
+          (openId, email, name, role, loginMethod, passwordHash, createdAt, updatedAt, lastSignedIn)
+         VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW(), ?)`,
+        [user.openId, email, user.name ?? null, user.role ?? "user", user.loginMethod ?? null,
+          user.passwordHash ?? null, user.lastSignedIn ?? now]
+      );
+    }
+    return;
+  }
+
   const existingOpenId = usersByOpenId.get(user.openId);
   const existingByEmail = email ? usersByOpenId.get(openIdByEmail.get(email) ?? "") : undefined;
   const existing = existingOpenId ?? existingByEmail;
@@ -142,16 +206,41 @@ export async function upsertUser(user: InsertUser): Promise<void> {
   if (created.email) openIdByEmail.set(created.email, created.openId);
 }
 export async function getUserByOpenId(openId: string) {
+  const pool = await getDb();
+  if (pool) {
+    const [rows] = await pool.execute("SELECT * FROM users WHERE openId = ? LIMIT 1", [openId]);
+    return (rows as LocalUserRecord[])[0];
+  }
   const user = usersByOpenId.get(openId);
   return user ? cloneUser(user) : undefined;
 }
 export async function getUserByEmail(email: string) {
   const normalized = normalizeEmail(email);
   if (!normalized) return undefined;
+  const pool = await getDb();
+  if (pool) {
+    const [rows] = await pool.execute("SELECT * FROM users WHERE LOWER(email) = ? LIMIT 1", [normalized]);
+    return (rows as LocalUserRecord[])[0];
+  }
   const openId = openIdByEmail.get(normalized);
   if (!openId) return undefined;
   const user = usersByOpenId.get(openId);
   return user ? cloneUser(user) : undefined;
+}
+
+function belongsToUser(record: any, userId: number) {
+  return Number(record?.user_id ?? record?.userId) === userId;
+}
+
+function isSubscribed(value: unknown) {
+  return value === true || value === 1 || value === "1" || value === "true";
+}
+
+function assertOwned(record: any, userId: number, entity: string) {
+  if (!record || record._error || !belongsToUser(record, userId)) {
+    throw new Error(`${entity} não encontrado ou sem permissão.`);
+  }
+  return record;
 }
 
 // ============ CONTACT LISTS ============
@@ -164,22 +253,23 @@ export async function createContactList(data: InsertContactList) {
 export async function getContactLists(userId: number) {
   const lists = await xanoFetch(`/mkt_contact_lists?user_id=${userId}`);
   if (!Array.isArray(lists)) return [];
+  const ownedLists = lists.filter(list => belongsToUser(list, userId));
 
   // Busca todos os membros de uma vez e distribui a contagem
   const allMembers = await xanoFetch(`/mkt_contact_list_members`);
   if (Array.isArray(allMembers)) {
-    lists.forEach(list => {
+    ownedLists.forEach(list => {
       // Conta na hora quantos contatos estão vinculados a esta lista
       list.contactCount = allMembers.filter((m: any) => m.list_id === list.id).length;
     });
   }
 
-  return lists.map(mapToApp);
+  return ownedLists.map(mapToApp);
 }
 
 export async function getContactListById(id: number, userId: number) {
   const list = await xanoFetch(`/mkt_contact_lists/${id}`);
-  if (!list || list._error) return undefined;
+  if (!list || list._error || !belongsToUser(list, userId)) return undefined;
 
   // Conta os membros na hora para esta lista específica
   const members = await xanoFetch(`/mkt_contact_list_members?list_id=${id}`);
@@ -191,15 +281,14 @@ export async function getContactListById(id: number, userId: number) {
 }
 
 export async function updateContactList(id: number, userId: number, data: Partial<InsertContactList>) {
-  const existing = await xanoFetch(`/mkt_contact_lists/${id}`);
-  if (existing && !existing._error) {
-    const payload = { ...existing, ...mapToXano(data), mkt_contact_lists_id: id, user_id: userId };
-    delete payload.created_at;
-    await xanoFetch(`/mkt_contact_lists/${id}`, 'PATCH', payload);
-  }
+  const existing = assertOwned(await xanoFetch(`/mkt_contact_lists/${id}`), userId, "Lista");
+  const payload = { ...existing, ...mapToXano(data), mkt_contact_lists_id: id, user_id: userId };
+  delete payload.created_at;
+  await xanoFetch(`/mkt_contact_lists/${id}`, 'PATCH', payload);
 }
 
 export async function deleteContactList(id: number, userId: number) {
+  assertOwned(await xanoFetch(`/mkt_contact_lists/${id}`), userId, "Lista");
   await xanoFetch(`/mkt_contact_lists/${id}`, 'DELETE');
 }
 
@@ -219,14 +308,14 @@ export async function recalcListCount(listId: number) {
 
 // ============ CONTACTS ============
 export async function createContact(data: InsertContact) {
-  const result = await xanoFetch('/mkt_contacts', 'POST', mapToXano({ ...data, user_id: 1, subscribed: true }));
+  const result = await xanoFetch('/mkt_contacts', 'POST', mapToXano({ ...data, subscribed: true }));
   return { id: result.id || Math.floor(Math.random() * 1000) };
 }
 
 export async function bulkCreateContacts(dataArr: InsertContact[]) {
   if (dataArr.length === 0) return [];
   const results = await Promise.all(
-    dataArr.map(c => xanoFetch('/mkt_contacts', 'POST', mapToXano({ ...c, user_id: c.userId || 1, subscribed: true })))
+    dataArr.map(c => xanoFetch('/mkt_contacts', 'POST', mapToXano({ ...c, subscribed: true })))
   );
   return results.filter(r => !r._error).map(r => ({ id: r.id }));
 }
@@ -234,6 +323,7 @@ export async function bulkCreateContacts(dataArr: InsertContact[]) {
 export async function getContacts(userId: number, opts?: { search?: string; listId?: number; page?: number; limit?: number }) {
   let contacts = await xanoFetch(`/mkt_contacts?user_id=${userId}`);
   if (!Array.isArray(contacts)) return { contacts: [], total: 0 };
+  contacts = contacts.filter(contact => belongsToUser(contact, userId));
 
   if (opts?.listId) {
     const members = await xanoFetch(`/mkt_contact_list_members?list_id=${opts.listId}`);
@@ -256,25 +346,27 @@ export async function getContacts(userId: number, opts?: { search?: string; list
 
 export async function getContactById(id: number, userId: number) {
   const result = await xanoFetch(`/mkt_contacts/${id}`);
-  return result && !result._error ? mapToApp(result) : undefined;
+  return result && !result._error && belongsToUser(result, userId) ? mapToApp(result) : undefined;
 }
 
 export async function updateContact(id: number, userId: number, data: Partial<InsertContact>) {
-  const existing = await xanoFetch(`/mkt_contacts/${id}`);
-  if (existing && !existing._error) {
-    const payload = { ...existing, ...mapToXano(data), mkt_contacts_id: id, user_id: userId };
-    delete payload.created_at;
-    await xanoFetch(`/mkt_contacts/${id}`, 'PATCH', payload);
-  }
+  const existing = assertOwned(await xanoFetch(`/mkt_contacts/${id}`), userId, "Contato");
+  const payload = { ...existing, ...mapToXano(data), mkt_contacts_id: id, user_id: userId };
+  delete payload.created_at;
+  await xanoFetch(`/mkt_contacts/${id}`, 'PATCH', payload);
 }
 
 export async function deleteContact(id: number, userId: number) {
+  assertOwned(await xanoFetch(`/mkt_contacts/${id}`), userId, "Contato");
   await xanoFetch(`/mkt_contacts/${id}`, 'DELETE');
 }
 
 // 🔥 ANTI-DUPLICIDADE: Verifica antes de adicionar para o Xano não bloquear
-export async function addContactsToList(contactIds: number[], listId: number) {
+export async function addContactsToList(contactIds: number[], listId: number, userId: number) {
   if (contactIds.length === 0) return;
+  assertOwned(await xanoFetch(`/mkt_contact_lists/${listId}`), userId, "Lista");
+  const ownedContacts = await Promise.all(contactIds.map(id => getContactById(id, userId)));
+  if (ownedContacts.some(contact => !contact)) throw new Error("Um ou mais contatos não pertencem ao usuário.");
   
   // 1. Busca quem já está na lista
   const existingMembers = await xanoFetch(`/mkt_contact_list_members?list_id=${listId}`);
@@ -294,7 +386,9 @@ export async function addContactsToList(contactIds: number[], listId: number) {
   await recalcListCount(listId);
 }
 
-export async function removeContactFromList(contactId: number, listId: number) {
+export async function removeContactFromList(contactId: number, listId: number, userId: number) {
+  assertOwned(await xanoFetch(`/mkt_contact_lists/${listId}`), userId, "Lista");
+  if (!await getContactById(contactId, userId)) throw new Error("Contato não encontrado ou sem permissão.");
   const members = await xanoFetch(`/mkt_contact_list_members?list_id=${listId}`);
   if (Array.isArray(members)) {
     const target = members.find((m: any) => m.contact_id === contactId);
@@ -303,15 +397,20 @@ export async function removeContactFromList(contactId: number, listId: number) {
   await recalcListCount(listId);
 }
 
-export async function getContactListsForContact(contactId: number) {
+export async function getContactListsForContact(contactId: number, userId: number) {
+  if (!await getContactById(contactId, userId)) return [];
   const members = await xanoFetch(`/mkt_contact_list_members?contact_id=${contactId}`);
   if (!Array.isArray(members) || members.length === 0) return [];
   const listIds = members.map((m: any) => m.list_id);
   const allLists = await xanoFetch('/mkt_contact_lists');
-  return Array.isArray(allLists) ? allLists.filter((l: any) => listIds.includes(l.id)).map(mapToApp) : [];
+  return Array.isArray(allLists)
+    ? allLists.filter((l: any) => belongsToUser(l, userId) && listIds.includes(l.id)).map(mapToApp)
+    : [];
 }
 
-export async function getListContacts(listId: number) {
+export async function getListContacts(listId: number, userId: number) {
+  const list = await getContactListById(listId, userId);
+  if (!list) return [];
   const members = await xanoFetch(`/mkt_contact_list_members?list_id=${listId}`);
   if (!Array.isArray(members) || members.length === 0) return [];
 
@@ -327,7 +426,7 @@ export async function getListContacts(listId: number) {
   const allContacts = await xanoFetch('/mkt_contacts');
   return Array.isArray(allContacts)
     ? allContacts
-        .filter((contact: any) => contactIds.has(Number(contact.id)) && contact.subscribed)
+        .filter((contact: any) => contactIds.has(Number(contact.id)) && belongsToUser(contact, userId) && isSubscribed(contact.subscribed))
         .map(mapToApp)
     : [];
 }
@@ -335,39 +434,41 @@ export async function getListContacts(listId: number) {
 // ============ CAMPAIGNS ============
 export async function createCampaign(data: InsertCampaign) {
   const result = await xanoFetch('/mkt_campaigns', 'POST', mapToXano({
-    ...data, status: data.status || 'draft', subjectConfirmed: false, user_id: 1
+    ...data, status: data.status || 'draft', subjectConfirmed: false
   }));
   return { id: result.id || Math.floor(Math.random() * 1000) };
 }
 
 export async function getCampaigns(userId: number) {
   const data = await xanoFetch(`/mkt_campaigns?user_id=${userId}`);
-  return Array.isArray(data) ? data.map(mapToApp) : [];
+  return Array.isArray(data) ? data.filter(item => belongsToUser(item, userId)).map(mapToApp) : [];
 }
 
 export async function getCampaignById(id: number, userId: number) {
   const result = await xanoFetch(`/mkt_campaigns/${id}`);
-  return result && !result._error ? mapToApp(result) : undefined;
+  return result && !result._error && belongsToUser(result, userId) ? mapToApp(result) : undefined;
 }
 
 export async function updateCampaign(id: number, userId: number, data: Partial<InsertCampaign>) {
-  const existing = await xanoFetch(`/mkt_campaigns/${id}`);
-  if (existing && !existing._error) {
-    const payload = { ...existing, ...mapToXano(data), mkt_campaigns_id: id, user_id: userId };
-    delete payload.created_at;
-    
-    const res = await xanoFetch(`/mkt_campaigns/${id}`, 'PATCH', payload);
-    if (res._error) throw new Error("Erro ao salvar no Xano");
-  }
+  const existing = assertOwned(await xanoFetch(`/mkt_campaigns/${id}`), userId, "Campanha");
+  const payload = { ...existing, ...mapToXano(data), mkt_campaigns_id: id, user_id: userId };
+  delete payload.created_at;
+
+  const res = await xanoFetch(`/mkt_campaigns/${id}`, 'PATCH', payload);
+  if (res._error) throw new Error("Erro ao salvar no Xano");
 }
 
 export async function deleteCampaign(id: number, userId: number) {
+  assertOwned(await xanoFetch(`/mkt_campaigns/${id}`), userId, "Campanha");
   await xanoFetch(`/mkt_campaigns/${id}`, 'DELETE');
 }
 
-export async function getCampaignAttachments(campaignId: number) {
+export async function getCampaignAttachments(campaignId: number, userId: number) {
+  if (!await getCampaignById(campaignId, userId)) return [];
   const data = await xanoFetch(`/mkt_campaign_attachments?campaigns_id=${campaignId}`);
-  return Array.isArray(data) ? data.map(mapToApp) : [];
+  return Array.isArray(data)
+    ? data.filter(item => Number(item.campaigns_id ?? item.campaign_id) === campaignId).map(mapToApp)
+    : [];
 }
 
 export async function addCampaignAttachment(data: any) {
@@ -375,25 +476,33 @@ export async function addCampaignAttachment(data: any) {
   return { id: result.id };
 }
 
-export async function deleteCampaignAttachment(id: number) {
+export async function deleteCampaignAttachment(id: number, userId: number) {
+  const attachment = await xanoFetch(`/mkt_campaign_attachments/${id}`);
+  const campaignId = Number(attachment?.campaigns_id ?? attachment?.campaign_id);
+  if (!campaignId || !await getCampaignById(campaignId, userId)) {
+    throw new Error("Anexo não encontrado ou sem permissão.");
+  }
   await xanoFetch(`/mkt_campaign_attachments/${id}`, 'DELETE');
 }
 
 // ============ AUDIT LOGS E SMTP ============
 export async function createAuditLog(data: InsertAuditLog) {
-  await xanoFetch('/mkt_audit_logs', 'POST', mapToXano({ ...data, user_id: 1 }));
+  await xanoFetch('/mkt_audit_logs', 'POST', mapToXano(data));
 }
 
 export async function getAuditLogs(userId: number, opts?: { page?: number; limit?: number; entityType?: string }) {
   let logs = await xanoFetch(`/mkt_audit_logs?user_id=${userId}`);
   if (!Array.isArray(logs)) return { logs: [], total: 0 };
+  logs = logs.filter(log => belongsToUser(log, userId));
   if (opts?.entityType) logs = logs.filter((l: any) => l.entityType === opts.entityType);
   return { logs: logs.slice(0, opts?.limit ?? 50).map(mapToApp), total: logs.length };
 }
 
 export async function getSmtpSettings(userId: number) {
   const data = await xanoFetch(`/mkt_smtp_settings?user_id=${userId}`);
-  const settings = Array.isArray(data) ? data[0] : (!data?._error ? data : undefined);
+  const settings = Array.isArray(data)
+    ? data.find(item => belongsToUser(item, userId))
+    : (!data?._error && belongsToUser(data, userId) ? data : undefined);
   return settings ? mapToApp(settings) : undefined;
 }
 
@@ -418,10 +527,13 @@ export async function getDashboardStats(userId: number) {
     xanoFetch(`/mkt_campaigns?user_id=${userId}`),
   ]);
 
+  const ownedContacts = Array.isArray(contacts) ? contacts.filter(item => belongsToUser(item, userId)) : [];
+  const ownedLists = Array.isArray(lists) ? lists.filter(item => belongsToUser(item, userId)) : [];
+  const ownedCampaigns = Array.isArray(campaigns) ? campaigns.filter(item => belongsToUser(item, userId)) : [];
   return {
-    totalContacts: Array.isArray(contacts) ? contacts.length : 0,
-    totalLists: Array.isArray(lists) ? lists.length : 0,
-    totalCampaigns: Array.isArray(campaigns) ? campaigns.length : 0,
-    sentCampaigns: Array.isArray(campaigns) ? campaigns.filter((c: any) => c.status === 'sent').length : 0,
+    totalContacts: ownedContacts.length,
+    totalLists: ownedLists.length,
+    totalCampaigns: ownedCampaigns.length,
+    sentCampaigns: ownedCampaigns.filter((c: any) => c.status === 'sent').length,
   };
 }

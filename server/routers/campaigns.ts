@@ -15,7 +15,6 @@ async function getTransporter(userId: number) {
       port: smtp.port,
       secure: smtp.encryption === "ssl",
       auth: { user: smtp.username, pass: smtp.password },
-      tls: smtp.encryption === "tls" ? { rejectUnauthorized: false } : undefined,
     }),
     smtp,
   };
@@ -40,7 +39,7 @@ export const campaignsRouter = router({
     .query(async ({ ctx, input }) => {
       const campaign = await db.getCampaignById(input.id, ctx.user.id);
       if (!campaign) throw new TRPCError({ code: "NOT_FOUND", message: "Campanha não encontrada" });
-      const attachments = await db.getCampaignAttachments(input.id);
+      const attachments = await db.getCampaignAttachments(input.id, ctx.user.id);
       return { ...campaign, attachments };
     }),
 
@@ -245,7 +244,7 @@ export const campaignsRouter = router({
   deleteAttachment: protectedProcedure
     .input(z.object({ id: z.number() }))
     .mutation(async ({ ctx, input }) => {
-      await db.deleteCampaignAttachment(input.id);
+      await db.deleteCampaignAttachment(input.id, ctx.user.id);
       return { success: true };
     }),
 
@@ -267,7 +266,7 @@ export const campaignsRouter = router({
 
       const { transporter, smtp } = await getTransporter(ctx.user.id);
       const { fromEmail, fromName } = resolveSender(campaign, smtp);
-      const attachments = await db.getCampaignAttachments(input.campaignId);
+      const attachments = await db.getCampaignAttachments(input.campaignId, ctx.user.id);
 
       let htmlBody = campaign.htmlContent || "";
       if (campaign.contentType === "image" && campaign.imageUrl) {
@@ -318,7 +317,7 @@ export const campaignsRouter = router({
         throw new TRPCError({ code: "BAD_REQUEST", message: "Selecione uma lista de destinatários" });
       }
 
-      const recipients = await db.getListContacts(campaign.listId);
+      const recipients = await db.getListContacts(campaign.listId, ctx.user.id);
       if (recipients.length === 0) {
         throw new TRPCError({ code: "BAD_REQUEST", message: "A lista selecionada não possui contatos ativos" });
       }
@@ -338,7 +337,7 @@ export const campaignsRouter = router({
         try {
           const { transporter, smtp } = await getTransporter(ctx.user.id);
           const { fromEmail, fromName } = resolveSender(campaign, smtp);
-          const attachments = await db.getCampaignAttachments(input.campaignId);
+          const attachments = await db.getCampaignAttachments(input.campaignId, ctx.user.id);
 
           let htmlBody = campaign.htmlContent || "";
           if (campaign.contentType === "image" && campaign.imageUrl) {
