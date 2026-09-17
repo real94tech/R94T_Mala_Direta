@@ -329,7 +329,8 @@ export const campaignsRouter = router({
         entityType: "campaign",
         entityId: input.campaignId,
         details: `Envio iniciado para ${recipients.length} destinatários`,
-        status: "in_progress",
+        // Xano's audit endpoint accepts `pending` for an operation in progress.
+        status: "pending",
       });
 
       // Send emails asynchronously
