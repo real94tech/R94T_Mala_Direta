@@ -1,0 +1,14 @@
+node_modules
+dist
+.git
+.gitignore
+.env
+.env.*
+!.env_exemple
+.manus
+server/_core/public
+coverage
+*.log
+*.db
+*.sqlite
+*.sqlite3
