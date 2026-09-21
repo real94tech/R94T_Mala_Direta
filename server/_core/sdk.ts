@@ -1,4 +1,4 @@
-import { AXIOS_TIMEOUT_MS, COOKIE_NAME, ONE_YEAR_MS } from "@shared/const";
+import { AXIOS_TIMEOUT_MS, COOKIE_NAME, ONE_YEAR_MS, XANO_COOKIE_NAME } from "@shared/const";
 import { ForbiddenError } from "@shared/_core/errors";
 import axios, { type AxiosInstance } from "axios";
 import { parse as parseCookieHeader } from "cookie";
@@ -7,6 +7,7 @@ import { SignJWT, jwtVerify } from "jose";
 import type { User } from "../../drizzle/schema";
 import * as db from "../db";
 import { ENV } from "./env";
+import { xanoGetMe } from "../xano";
 import type {
   ExchangeTokenRequest,
   ExchangeTokenResponse,
@@ -264,6 +265,31 @@ class SDKServer {
 
     if (!session) {
       throw ForbiddenError("Invalid session cookie");
+    }
+
+    const xanoToken = cookies.get(XANO_COOKIE_NAME);
+    if (xanoToken) {
+      try {
+        const xanoUser = await xanoGetMe(xanoToken);
+        const id = Number(xanoUser?.id ?? xanoUser?.user_id ?? xanoUser?.userId);
+        if (!Number.isFinite(id) || id <= 0) throw new Error("Xano user id missing");
+        const name = xanoUser.name ?? xanoUser.full_name ?? xanoUser.email ?? session.name;
+        return {
+          id,
+          openId: `xano_${id}`,
+          name,
+          email: xanoUser.email ?? null,
+          loginMethod: "xano",
+          role: xanoUser.role === "admin" ? "admin" : "user",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          lastSignedIn: new Date(),
+          passwordHash: null,
+        } as User;
+      } catch (error) {
+        console.error("[XanoAuth] Failed to restore Xano session:", error);
+        throw ForbiddenError("Invalid Xano session");
+      }
     }
 
     const sessionUserId = session.openId;

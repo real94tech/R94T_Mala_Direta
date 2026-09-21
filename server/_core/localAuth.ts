@@ -8,10 +8,11 @@
 import bcrypt from "bcryptjs";
 import type { Express, Request, Response } from "express";
 import { SignJWT, jwtVerify } from "jose";
-import { COOKIE_NAME, ONE_YEAR_MS } from "@shared/const";
+import { COOKIE_NAME, ONE_YEAR_MS, XANO_COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./cookies";
 import { ENV } from "./env";
 import * as db from "../db";
+import { xanoGetMe, xanoLogin } from "../xano";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -20,6 +21,16 @@ function getSessionSecret() {
     throw new Error("JWT_SECRET não configurado.");
   }
   return new TextEncoder().encode(ENV.cookieSecret || "local-dev-secret-change-me");
+}
+
+function getXanoToken(payload: any) {
+  const token = payload?.authToken ?? payload?.auth_token ?? payload?.token;
+  return typeof token === "string" && token.length > 0 ? token : null;
+}
+
+function getXanoUserId(user: any) {
+  const id = Number(user?.id ?? user?.user_id ?? user?.userId);
+  return Number.isFinite(id) && id > 0 ? id : null;
 }
 
 export async function createLocalSessionToken(openId: string, name: string): Promise<string> {
@@ -75,40 +86,53 @@ export function registerLocalAuthRoutes(app: Express) {
     }
 
     try {
-      // Look up user by email in local DB
-      const user = await db.getUserByEmail(email.trim().toLowerCase());
-
-      if (!user) {
-        res.status(401).json({ error: "Email ou senha incorretos." });
+      const loginResponse = await xanoLogin({
+        email: email.trim().toLowerCase(),
+        password,
+      });
+      const xanoToken = getXanoToken(loginResponse);
+      if (!xanoToken) {
+        console.error("[XanoAuth] Login sem token de autenticação na resposta.");
+        res.status(502).json({ error: "O Xano não retornou um token de sessão." });
         return;
       }
 
-      // Verify password hash
-      const passwordField = (user as any).passwordHash ?? (user as any).password ?? null;
-      if (!passwordField) {
-        // No password set — this user was created via OAuth; cannot login locally
-        res.status(401).json({ error: "Esta conta não possui senha. Use o login OAuth." });
+      const xanoUser = loginResponse?.user ?? await xanoGetMe(xanoToken);
+      const xanoUserId = getXanoUserId(xanoUser);
+      if (!xanoUserId) {
+        console.error("[XanoAuth] Usuário autenticado sem id na resposta.");
+        res.status(502).json({ error: "O Xano não retornou os dados do usuário." });
         return;
       }
 
-      const valid = await verifyPassword(password, passwordField);
-      if (!valid) {
-        res.status(401).json({ error: "Email ou senha incorretos." });
-        return;
-      }
+      const openId = `xano_${xanoUserId}`;
+      const name = xanoUser.name ?? xanoUser.full_name ?? xanoUser.email ?? email;
 
       // Create session token
-      const token = await createLocalSessionToken(user.openId, user.name ?? user.email ?? "");
+      const token = await createLocalSessionToken(openId, name);
       const cookieOptions = getSessionCookieOptions(req);
       res.cookie(COOKIE_NAME, token, { ...cookieOptions, maxAge: ONE_YEAR_MS });
 
-      // Update lastSignedIn
-      await db.upsertUser({ openId: user.openId, lastSignedIn: new Date() });
+      // The Xano token is kept separately so the session survives app restarts
+      // without requiring a local users table.
+      res.cookie(XANO_COOKIE_NAME, xanoToken, { ...cookieOptions, maxAge: ONE_YEAR_MS });
 
-      res.json({ success: true, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
-    } catch (error) {
+      res.json({
+        success: true,
+        user: {
+          id: xanoUserId,
+          name,
+          email: xanoUser.email ?? email,
+          role: xanoUser.role ?? "user",
+        },
+      });
+    } catch (error: any) {
+      if (error?.response?.status === 401 || error?.response?.status === 403) {
+        res.status(401).json({ error: "Email ou senha incorretos." });
+        return;
+      }
       console.error("[LocalAuth] Login error:", error);
-      res.status(500).json({ error: "Erro interno ao fazer login." });
+      res.status(502).json({ error: "Não foi possível autenticar no Xano." });
     }
   });
 
@@ -118,6 +142,7 @@ export function registerLocalAuthRoutes(app: Express) {
   app.post("/api/auth/logout", (req: Request, res: Response) => {
     const cookieOptions = getSessionCookieOptions(req);
     res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+    res.clearCookie(XANO_COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
     res.json({ success: true });
   });
 
