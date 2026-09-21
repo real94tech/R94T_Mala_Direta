@@ -15,11 +15,12 @@ ENV PORT=3000
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-# The bundled server still loads the Vite module graph at startup.
+# Keep the full dependency tree because the admin setup script uses mysql2 and bcryptjs.
 RUN npm ci --ignore-scripts --legacy-peer-deps \
     && npm cache clean --force
 
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/scripts ./scripts
 
 EXPOSE 3000
 
