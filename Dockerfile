@@ -15,7 +15,8 @@ ENV PORT=3000
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts --legacy-peer-deps \
+# The bundled server still loads the Vite module graph at startup.
+RUN npm ci --ignore-scripts --legacy-peer-deps \
     && npm cache clean --force
 
 COPY --from=build /app/dist ./dist
