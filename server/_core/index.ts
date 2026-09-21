@@ -48,7 +48,9 @@ async function startServer() {
   );
   // development mode uses Vite, production mode uses static files
   if (process.env.NODE_ENV === "development") {
-    const { setupVite } = await import("./vite");
+    // Keep the development-only module out of the production bundle.
+    const viteModule = "./" + "vite";
+    const { setupVite } = await import(viteModule);
     await setupVite(app, server);
   } else {
     serveStatic(app);
