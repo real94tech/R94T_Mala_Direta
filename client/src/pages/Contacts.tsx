@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useRef } from "react";
+import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import { trpc } from "@/lib/trpc";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -19,7 +19,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
 import { Plus, Upload, Search, Trash2, Edit, ChevronLeft, ChevronRight, Users, ClipboardPaste, FileSpreadsheet, CheckCircle2, AlertCircle, FileUp, File } from "lucide-react";
 import * as XLSX from "xlsx";
-import { useLocation } from "wouter";
+import { useLocation, useSearch } from "wouter";
 
 type ContactRow = {
   id: number;
@@ -33,7 +33,8 @@ type ContactRow = {
 };
 
 export default function Contacts() {
-  const [location, setLocation] = useLocation();
+  const [, setLocation] = useLocation();
+  const query = useSearch();
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState("");
   const [showAddDialog, setShowAddDialog] = useState(false);
@@ -41,8 +42,11 @@ export default function Contacts() {
   const [showEditDialog, setShowEditDialog] = useState(false);
   const [editContact, setEditContact] = useState<any>(null);
 
-  const selectedList = new URLSearchParams(location.split("?")[1] ?? "").get("list") ?? "all";
+  const listParam = new URLSearchParams(query).get("list");
+  const selectedList = listParam && /^[1-9]\d*$/.test(listParam) ? listParam : "all";
   const listIdFilter = selectedList !== "all" ? Number(selectedList) : undefined;
+
+  useEffect(() => { setPage(1); }, [selectedList]);
 
   const handleListChange = (listId: string) => {
     setPage(1);
@@ -54,9 +58,27 @@ export default function Contacts() {
   });
   const { data: lists } = trpc.lists.list.useQuery();
   const utils = trpc.useUtils();
+  const addToListMutation = trpc.contacts.addToList.useMutation();
 
   const createMutation = trpc.contacts.create.useMutation({
-    onSuccess: () => { toast.success("Contato criado com sucesso"); setShowAddDialog(false); utils.contacts.list.invalidate(); utils.dashboard.stats.invalidate(); },
+    onSuccess: async (result) => {
+      setShowAddDialog(false);
+      if (listIdFilter) {
+        try {
+          await addToListMutation.mutateAsync({ contactIds: [result.id], listId: listIdFilter });
+        } catch (error) {
+          toast.warning(`Contato criado, mas não vinculado à lista: ${(error as Error).message}`);
+          utils.contacts.list.invalidate();
+          utils.lists.list.invalidate();
+          utils.dashboard.stats.invalidate();
+          return;
+        }
+      }
+      toast.success("Contato criado com sucesso");
+      utils.contacts.list.invalidate();
+      utils.lists.list.invalidate();
+      utils.dashboard.stats.invalidate();
+    },
     onError: (err) => toast.error(err.message),
   });
   const updateMutation = trpc.contacts.update.useMutation({
@@ -64,7 +86,7 @@ export default function Contacts() {
     onError: (err) => toast.error(err.message),
   });
   const deleteMutation = trpc.contacts.delete.useMutation({
-    onSuccess: () => { toast.success("Contato removido"); utils.contacts.list.invalidate(); utils.dashboard.stats.invalidate(); },
+    onSuccess: () => { toast.success("Contato removido"); utils.contacts.list.invalidate(); utils.lists.list.invalidate(); utils.dashboard.stats.invalidate(); },
     onError: (err) => toast.error(err.message),
   });
   const importMutation = trpc.contacts.quickImport.useMutation({
@@ -72,10 +94,13 @@ export default function Contacts() {
       if (result.imported > 0) {
         toast.success(`${result.imported} contato(s) importado(s) com sucesso!`);
       }
+      if (result.linked > 0) {
+        toast.success(`${result.linked} contato(s) vinculado(s) à lista`);
+      }
       if (result.errors.length > 0) {
         toast.warning(`${result.errors.length} linha(s) com erro`);
       }
-      if (result.imported === 0 && result.errors.length === 0) {
+      if (result.imported === 0 && result.linked === 0 && result.errors.length === 0) {
         toast.error("Nenhum contato foi encontrado nos dados colados.");
       }
       setShowImportDialog(false);
@@ -195,7 +220,7 @@ export default function Contacts() {
 
       <AddContactDialog open={showAddDialog} onOpenChange={setShowAddDialog} onSubmit={(data) => createMutation.mutate(data)} isLoading={createMutation.isPending} />
       {editContact && <EditContactDialog open={showEditDialog} onOpenChange={setShowEditDialog} contact={editContact} onSubmit={(data) => updateMutation.mutate({ id: editContact.id, ...data })} isLoading={updateMutation.isPending} />}
-      <QuickImportDialog open={showImportDialog} onOpenChange={setShowImportDialog} lists={lists || []} onSubmit={(data) => importMutation.mutate(data)} isLoading={importMutation.isPending} />
+      <QuickImportDialog open={showImportDialog} onOpenChange={setShowImportDialog} initialListId={selectedList} lists={lists || []} onSubmit={(data) => importMutation.mutate(data)} isLoading={importMutation.isPending} />
     </div>
   );
 }
@@ -252,13 +277,17 @@ function EditContactDialog({ open, onOpenChange, contact, onSubmit, isLoading }:
   );
 }
 
-function QuickImportDialog({ open, onOpenChange, lists, onSubmit, isLoading }: { open: boolean; onOpenChange: (v: boolean) => void; lists: any[]; onSubmit: (data: { rawText: string; listId?: number }) => void; isLoading: boolean; }) {
+function QuickImportDialog({ open, onOpenChange, initialListId, lists, onSubmit, isLoading }: { open: boolean; onOpenChange: (v: boolean) => void; initialListId: string; lists: any[]; onSubmit: (data: { rawText: string; listId?: number }) => void; isLoading: boolean; }) {
   const [rawText, setRawText] = useState("");
   const [listId, setListId] = useState<string>("none");
   const [isDragging, setIsDragging] = useState(false);
   const [fileName, setFileName] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dropZoneRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (open) setListId(initialListId === "all" ? "none" : initialListId);
+  }, [open, initialListId]);
 
   // Process Excel/CSV file into tab-separated text
   const processFile = useCallback((file: globalThis.File) => {

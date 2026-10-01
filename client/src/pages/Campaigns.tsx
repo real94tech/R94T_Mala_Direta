@@ -23,7 +23,7 @@ const statusMap: Record<string, { label: string; variant: "default" | "secondary
 
 export default function Campaigns() {
   const [, setLocation] = useLocation();
-  const { data: campaigns, isLoading } = trpc.campaigns.list.useQuery();
+  const { data: campaigns, isLoading } = trpc.campaigns.list.useQuery(undefined, { refetchInterval: 5000 });
   const utils = trpc.useUtils();
 
   const deleteMutation = trpc.campaigns.delete.useMutation({

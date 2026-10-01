@@ -29,7 +29,12 @@ export const contactsRouter = router({
       company: z.string().optional(),
     }))
     .mutation(async ({ ctx, input }) => {
-      const result = await db.createContact({ ...input, userId: ctx.user.id });
+      const email = input.email.trim().toLowerCase();
+      const contacts = await db.getAllUserContacts(ctx.user.id);
+      if (contacts.some(contact => contact.email.trim().toLowerCase() === email)) {
+        throw new Error("Este e-mail já está cadastrado. Para vinculá-lo a uma lista, use a importação selecionando a lista.");
+      }
+      const result = await db.createContact({ ...input, email, userId: ctx.user.id });
       await db.createAuditLog({
         userId: ctx.user.id,
         action: "create",
@@ -212,14 +217,39 @@ export const contactsRouter = router({
         });
       }
 
-      let imported = 0;
-      if (contactsToCreate.length > 0) {
-        const results = await db.bulkCreateContacts(contactsToCreate);
-        imported = results.length;
+      if (input.listId && !await db.getContactListById(input.listId, ctx.user.id)) {
+        throw new Error("Lista não encontrada ou sem permissão.");
+      }
 
-        if (input.listId) {
-          await db.addContactsToList(results.map(r => r.id), input.listId, ctx.user.id);
-        }
+      const existingContacts = await db.getAllUserContacts(ctx.user.id);
+      const existingByEmail = new Map(existingContacts.map(contact => [contact.email.trim().toLowerCase(), contact.id]));
+      const seenEmails = new Set<string>();
+      const idsToLink = new Set<number>();
+      const newContacts: typeof contactsToCreate = [];
+      for (const contact of contactsToCreate) {
+        if (seenEmails.has(contact.email)) continue;
+        seenEmails.add(contact.email);
+        const existingId = existingByEmail.get(contact.email);
+        if (existingId) idsToLink.add(existingId);
+        else newContacts.push(contact);
+      }
+
+      let imported = 0;
+      for (let offset = 0; offset < newContacts.length; offset += 10) {
+        const batch = newContacts.slice(offset, offset + 10);
+        const outcomes = await Promise.allSettled(batch.map(contact => db.createContact(contact)));
+        outcomes.forEach((outcome, index) => {
+          if (outcome.status === "fulfilled") {
+            imported++;
+            idsToLink.add(outcome.value.id);
+          } else {
+            errors.push(`E-mail ${batch[index].email}: falha ao salvar no Xano`);
+          }
+        });
+      }
+
+      if (input.listId && idsToLink.size > 0) {
+        await db.addContactsToList(Array.from(idsToLink), input.listId, ctx.user.id);
       }
 
       await db.createAuditLog({
@@ -230,7 +260,7 @@ export const contactsRouter = router({
         status: errors.length > 0 && imported === 0 ? "error" : "success",
       });
 
-      return { imported, errors, total: lines.length - dataStartIndex };
+      return { imported, linked: input.listId ? idsToLink.size : 0, errors, total: lines.length - dataStartIndex };
     }),
 
   addToList: protectedProcedure

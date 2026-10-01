@@ -6,6 +6,14 @@ import { storagePut } from "../storage";
 import { nanoid } from "nanoid";
 import nodemailer from "nodemailer";
 
+const campaignsInFlight = new Set<number>();
+
+function assertEditable(campaign: { id?: number; status: string }) {
+  if (campaign.status === "sending" || campaign.status === "sent" || campaignsInFlight.has(Number(campaign.id))) {
+    throw new TRPCError({ code: "BAD_REQUEST", message: "Esta campanha já foi enviada ou está em envio." });
+  }
+}
+
 async function getTransporter(userId: number) {
   const smtp = await db.getSmtpSettings(userId);
   if (!smtp) throw new TRPCError({ code: "BAD_REQUEST", message: "Configure as credenciais SMTP antes de enviar e-mails." });
@@ -49,6 +57,9 @@ export const campaignsRouter = router({
       listId: z.number().optional(),
     }))
     .mutation(async ({ ctx, input }) => {
+      if (input.listId && !await db.getContactListById(input.listId, ctx.user.id)) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "Lista não encontrada" });
+      }
       const result = await db.createCampaign({
         name: input.name,
         userId: ctx.user.id,
@@ -69,6 +80,9 @@ export const campaignsRouter = router({
   delete: protectedProcedure
     .input(z.object({ id: z.number() }))
     .mutation(async ({ ctx, input }) => {
+      const campaign = await db.getCampaignById(input.id, ctx.user.id);
+      if (!campaign) throw new TRPCError({ code: "NOT_FOUND" });
+      assertEditable(campaign);
       await db.deleteCampaign(input.id, ctx.user.id);
       await db.createAuditLog({
         userId: ctx.user.id,
@@ -90,11 +104,19 @@ export const campaignsRouter = router({
     .mutation(async ({ ctx, input }) => {
       const campaign = await db.getCampaignById(input.campaignId, ctx.user.id);
       if (!campaign) throw new TRPCError({ code: "NOT_FOUND" });
+      assertEditable(campaign);
       const list = await db.getContactListById(input.listId, ctx.user.id);
       if (!list) throw new TRPCError({ code: "NOT_FOUND", message: "Lista não encontrada" });
+      const changed = Number(campaign.listId) !== input.listId;
+      const recipientCount = (await db.getListContacts(input.listId, ctx.user.id)).length;
       await db.updateCampaign(input.campaignId, ctx.user.id, {
         listId: input.listId,
-        recipientCount: list.contactCount,
+        recipientCount,
+        ...(changed ? {
+          status: campaign.subjectConfirmed ? "subject_confirmed" : campaign.subject ? "subject_defined" : "draft",
+          testSentAt: null,
+          testSentTo: null,
+        } : {}),
       });
       return { success: true };
     }),
@@ -111,6 +133,7 @@ export const campaignsRouter = router({
     .mutation(async ({ ctx, input }) => {
       const campaign = await db.getCampaignById(input.campaignId, ctx.user.id);
       if (!campaign) throw new TRPCError({ code: "NOT_FOUND" });
+      assertEditable(campaign);
       await db.updateCampaign(input.campaignId, ctx.user.id, {
         subject: input.subject,
         previewText: input.previewText,
@@ -118,6 +141,8 @@ export const campaignsRouter = router({
         senderEmail: input.senderEmail,
         status: "subject_defined",
         subjectConfirmed: false,
+        testSentAt: null,
+        testSentTo: null,
       });
       await db.createAuditLog({
         userId: ctx.user.id,
@@ -139,6 +164,7 @@ export const campaignsRouter = router({
     .mutation(async ({ ctx, input }) => {
       const campaign = await db.getCampaignById(input.campaignId, ctx.user.id);
       if (!campaign) throw new TRPCError({ code: "NOT_FOUND" });
+      assertEditable(campaign);
       if (!campaign.subject) throw new TRPCError({ code: "BAD_REQUEST", message: "Defina o assunto primeiro" });
       if (campaign.subject !== input.confirmedSubject) {
         throw new TRPCError({ code: "BAD_REQUEST", message: "O assunto confirmado não corresponde ao assunto definido. Verifique e tente novamente." });
@@ -169,6 +195,7 @@ export const campaignsRouter = router({
     .mutation(async ({ ctx, input }) => {
       const campaign = await db.getCampaignById(input.campaignId, ctx.user.id);
       if (!campaign) throw new TRPCError({ code: "NOT_FOUND" });
+      assertEditable(campaign);
 
       // Validate HTML size on server side as well
       if (input.htmlContent) {
@@ -186,6 +213,8 @@ export const campaignsRouter = router({
         htmlContent: input.htmlContent,
         imageUrl: input.imageUrl,
         status: "content_ready",
+        testSentAt: null,
+        testSentTo: null,
       });
       await db.createAuditLog({
         userId: ctx.user.id,
@@ -209,6 +238,7 @@ export const campaignsRouter = router({
     .mutation(async ({ ctx, input }) => {
       const campaign = await db.getCampaignById(input.campaignId, ctx.user.id);
       if (!campaign) throw new TRPCError({ code: "NOT_FOUND" });
+      assertEditable(campaign);
       const buffer = Buffer.from(input.base64Data, "base64");
       const fileKey = `campaigns/${input.campaignId}/images/${nanoid()}-${input.fileName}`;
       const { url } = await storagePut(fileKey, buffer, input.mimeType);
@@ -227,9 +257,17 @@ export const campaignsRouter = router({
     .mutation(async ({ ctx, input }) => {
       const campaign = await db.getCampaignById(input.campaignId, ctx.user.id);
       if (!campaign) throw new TRPCError({ code: "NOT_FOUND" });
+      assertEditable(campaign);
       const buffer = Buffer.from(input.base64Data, "base64");
       const fileKey = `campaigns/${input.campaignId}/attachments/${nanoid()}-${input.fileName}`;
       const { url } = await storagePut(fileKey, buffer, input.mimeType);
+      if (campaign.status === "test_sent") {
+        await db.updateCampaign(input.campaignId, ctx.user.id, {
+          status: "content_ready",
+          testSentAt: null,
+          testSentTo: null,
+        });
+      }
       const result = await db.addCampaignAttachment({
         campaignId: input.campaignId,
         fileName: input.fileName,
@@ -244,6 +282,17 @@ export const campaignsRouter = router({
   deleteAttachment: protectedProcedure
     .input(z.object({ id: z.number() }))
     .mutation(async ({ ctx, input }) => {
+      const attachment = await db.getCampaignAttachmentById(input.id, ctx.user.id);
+      const campaign = await db.getCampaignById(attachment.campaignId, ctx.user.id);
+      if (!campaign) throw new TRPCError({ code: "NOT_FOUND" });
+      assertEditable(campaign);
+      if (campaign.status === "test_sent") {
+        await db.updateCampaign(attachment.campaignId, ctx.user.id, {
+          status: "content_ready",
+          testSentAt: null,
+          testSentTo: null,
+        });
+      }
       await db.deleteCampaignAttachment(input.id, ctx.user.id);
       return { success: true };
     }),
@@ -254,6 +303,7 @@ export const campaignsRouter = router({
     .mutation(async ({ ctx, input }) => {
       const campaign = await db.getCampaignById(input.campaignId, ctx.user.id);
       if (!campaign) throw new TRPCError({ code: "NOT_FOUND" });
+      assertEditable(campaign);
       if (!campaign.subject || !campaign.subjectConfirmed) {
         throw new TRPCError({ code: "BAD_REQUEST", message: "Confirme o assunto antes de enviar o teste" });
       }
@@ -310,94 +360,113 @@ export const campaignsRouter = router({
     .mutation(async ({ ctx, input }) => {
       const campaign = await db.getCampaignById(input.campaignId, ctx.user.id);
       if (!campaign) throw new TRPCError({ code: "NOT_FOUND" });
+      if (campaignsInFlight.has(input.campaignId)) {
+        throw new TRPCError({ code: "CONFLICT", message: "Esta campanha já está sendo enviada." });
+      }
+      assertEditable(campaign);
       if (campaign.status !== "test_sent") {
         throw new TRPCError({ code: "BAD_REQUEST", message: "Envie um e-mail de teste antes do envio final" });
       }
       if (!campaign.listId) {
         throw new TRPCError({ code: "BAD_REQUEST", message: "Selecione uma lista de destinatários" });
       }
+      campaignsInFlight.add(input.campaignId);
+      try {
+        const recipients = await db.getListContacts(campaign.listId, ctx.user.id);
+        if (recipients.length === 0) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "A lista selecionada não possui contatos ativos" });
+        }
+        const { transporter, smtp } = await getTransporter(ctx.user.id);
+        const { fromEmail, fromName } = resolveSender(campaign, smtp);
+        const attachments = await db.getCampaignAttachments(input.campaignId, ctx.user.id);
+        await transporter.verify();
 
-      const recipients = await db.getListContacts(campaign.listId, ctx.user.id);
-      if (recipients.length === 0) {
-        throw new TRPCError({ code: "BAD_REQUEST", message: "A lista selecionada não possui contatos ativos" });
-      }
+        await db.updateCampaign(input.campaignId, ctx.user.id, {
+          status: "sending",
+          recipientCount: recipients.length,
+          sentCount: 0,
+          failedCount: 0,
+        });
+        await db.createAuditLog({
+          userId: ctx.user.id,
+          action: "send_campaign_start",
+          entityType: "campaign",
+          entityId: input.campaignId,
+          details: `Envio iniciado para ${recipients.length} destinatários`,
+          status: "pending",
+        });
 
-      await db.updateCampaign(input.campaignId, ctx.user.id, { status: "sending" });
-      await db.createAuditLog({
-        userId: ctx.user.id,
-        action: "send_campaign_start",
-        entityType: "campaign",
-        entityId: input.campaignId,
-        details: `Envio iniciado para ${recipients.length} destinatários`,
-        // Xano's audit endpoint accepts `pending` for an operation in progress.
-        status: "pending",
-      });
-
-      // Send emails asynchronously
-      (async () => {
-        try {
-          const { transporter, smtp } = await getTransporter(ctx.user.id);
-          const { fromEmail, fromName } = resolveSender(campaign, smtp);
-          const attachments = await db.getCampaignAttachments(input.campaignId, ctx.user.id);
-
-          let htmlBody = campaign.htmlContent || "";
-          if (campaign.contentType === "image" && campaign.imageUrl) {
-            htmlBody = `<div style="text-align:center;"><img src="${campaign.imageUrl}" style="max-width:100%;" alt="Campaign Image" /></div>`;
-          }
-
-          const mailAttachments = attachments.map(a => ({
-            filename: a.fileName,
-            path: a.fileUrl,
-          }));
-
+        (async () => {
           let sentCount = 0;
           let failedCount = 0;
-
-          for (const recipient of recipients) {
-            try {
-              await transporter.sendMail({
-                from: `"${fromName}" <${fromEmail}>`,
-                to: recipient.email,
-                subject: campaign.subject!,
-                html: htmlBody,
-                attachments: mailAttachments,
-              });
-              sentCount++;
-            } catch (err) {
-              failedCount++;
-              console.error(`Failed to send to ${recipient.email}:`, err);
+          try {
+            let htmlBody = campaign.htmlContent || "";
+            if (campaign.contentType === "image" && campaign.imageUrl) {
+              htmlBody = `<div style="text-align:center;"><img src="${campaign.imageUrl}" style="max-width:100%;" alt="Campaign Image" /></div>`;
             }
+
+            const mailAttachments = attachments.map(a => ({
+              filename: a.fileName,
+              path: a.fileUrl,
+            }));
+
+            for (const recipient of recipients) {
+              try {
+                await transporter.sendMail({
+                  from: `"${fromName}" <${fromEmail}>`,
+                  to: recipient.email,
+                  subject: campaign.subject!,
+                  html: htmlBody,
+                  attachments: mailAttachments,
+                });
+                sentCount++;
+              } catch (err) {
+                failedCount++;
+                console.error(`Failed to send to ${recipient.email}:`, err);
+              }
+              await db.updateCampaign(input.campaignId, ctx.user.id, { sentCount, failedCount });
+            }
+
+            await db.updateCampaign(input.campaignId, ctx.user.id, {
+              status: failedCount > 0 ? "failed" : "sent",
+              sentCount,
+              failedCount,
+              sentAt: new Date(),
+            });
+
+            await db.createAuditLog({
+              userId: ctx.user.id,
+              action: "send_campaign_complete",
+              entityType: "campaign",
+              entityId: input.campaignId,
+              details: `Envio concluído: ${sentCount} enviados, ${failedCount} falhas`,
+              status: failedCount > 0 ? "error" : "success",
+            });
+          } catch (err) {
+            console.error(`Campaign ${input.campaignId} failed:`, err);
+            try {
+              await db.updateCampaign(input.campaignId, ctx.user.id, { status: "failed", sentCount, failedCount });
+              await db.createAuditLog({
+                userId: ctx.user.id,
+                action: "send_campaign_error",
+                entityType: "campaign",
+                entityId: input.campaignId,
+                details: `Erro no envio: ${(err as Error).message}`,
+                status: "error",
+              });
+            } catch (saveError) {
+              console.error(`Campaign ${input.campaignId} status could not be saved:`, saveError);
+            }
+          } finally {
+            campaignsInFlight.delete(input.campaignId);
           }
+        })();
 
-          await db.updateCampaign(input.campaignId, ctx.user.id, {
-            status: "sent",
-            sentCount,
-            failedCount,
-            sentAt: new Date(),
-          });
-
-          await db.createAuditLog({
-            userId: ctx.user.id,
-            action: "send_campaign_complete",
-            entityType: "campaign",
-            entityId: input.campaignId,
-            details: `Envio concluído: ${sentCount} enviados, ${failedCount} falhas`,
-            status: failedCount > 0 ? "error" : "success",
-          });
-        } catch (err) {
-          await db.updateCampaign(input.campaignId, ctx.user.id, { status: "failed" });
-          await db.createAuditLog({
-            userId: ctx.user.id,
-            action: "send_campaign_error",
-            entityType: "campaign",
-            entityId: input.campaignId,
-            details: `Erro no envio: ${(err as Error).message}`,
-            status: "error",
-          });
-        }
-      })();
-
-      return { success: true, recipientCount: recipients.length };
+        return { success: true, recipientCount: recipients.length };
+      } catch (error) {
+        campaignsInFlight.delete(input.campaignId);
+        throw error;
+      }
     }),
 
   // Get campaign send status

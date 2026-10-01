@@ -59,7 +59,7 @@ export default function CampaignWizard() {
   const { data: lists } = trpc.lists.list.useQuery();
   const { data: campaign, refetch: refetchCampaign } = trpc.campaigns.getById.useQuery(
     { id: campaignId! },
-    { enabled: !!campaignId }
+    { enabled: !!campaignId, refetchInterval: query => query.state.data?.status === "sending" ? 3000 : false }
   );
   const utils = trpc.useUtils();
 
@@ -93,7 +93,7 @@ export default function CampaignWizard() {
       setAttachments(campaign.attachments || []);
 
       // Determine current step based on status
-      if (campaign.status === "sent" || campaign.status === "sending") {
+      if (campaign.status === "sent" || campaign.status === "sending" || campaign.status === "failed") {
         setCurrentStep("send");
       } else if (campaign.status === "test_sent") {
         setCurrentStep("send");
@@ -165,6 +165,7 @@ export default function CampaignWizard() {
     onSuccess: (result) => {
       setAttachments(prev => [...prev, result]);
       toast.success("Anexo adicionado");
+      refetchCampaign();
     },
     onError: (err) => toast.error(err.message),
   });
@@ -173,6 +174,7 @@ export default function CampaignWizard() {
     onSuccess: (_, vars) => {
       setAttachments(prev => prev.filter(a => a.id !== vars.id));
       toast.success("Anexo removido");
+      refetchCampaign();
     },
   });
 
@@ -187,7 +189,7 @@ export default function CampaignWizard() {
 
   const sendCampaignMutation = trpc.campaigns.sendCampaign.useMutation({
     onSuccess: (result) => {
-      toast.success(`Campanha enviada para ${result.recipientCount} destinatários`);
+      toast.success(`Envio iniciado para ${result.recipientCount} destinatários`);
       utils.campaigns.list.invalidate();
       utils.dashboard.stats.invalidate();
       refetchCampaign();
@@ -360,7 +362,7 @@ export default function CampaignWizard() {
   };
 
   const currentStepIndex = STEPS.findIndex(s => s.key === currentStep);
-  const isSent = campaign?.status === "sent" || campaign?.status === "sending";
+  const isSent = campaign?.status === "sent" || campaign?.status === "sending" || campaign?.status === "failed";
 
   return (
     <div className="space-y-6 max-w-4xl mx-auto">
@@ -806,18 +808,19 @@ export default function CampaignWizard() {
             </div>
 
             {isSent && (
-              <div className="p-4 rounded-lg bg-green-50 border border-green-200">
+              <div className={`p-4 rounded-lg border ${campaign?.status === "failed" ? "bg-red-50 border-red-200" : "bg-green-50 border-green-200"}`}>
                 <div className="flex items-center gap-2">
-                  <CheckCircle2 className="h-5 w-5 text-green-600" />
+                  {campaign?.status === "failed"
+                    ? <AlertTriangle className="h-5 w-5 text-red-600" />
+                    : <CheckCircle2 className="h-5 w-5 text-green-600" />}
                   <div>
-                    <p className="font-medium text-green-800 text-sm">
-                      {campaign?.status === "sending" ? "Campanha sendo enviada..." : "Campanha enviada com sucesso"}
+                    <p className={`font-medium text-sm ${campaign?.status === "failed" ? "text-red-800" : "text-green-800"}`}>
+                      {campaign?.status === "sending" ? "Campanha sendo enviada..." : campaign?.status === "failed" ? "Envio interrompido ou com falhas" : "Campanha enviada com sucesso"}
                     </p>
-                    {campaign?.sentAt && (
-                      <p className="text-xs text-green-700">
-                        {campaign.sentCount} enviados, {campaign.failedCount} falhas - {new Date(campaign.sentAt).toLocaleString("pt-BR")}
-                      </p>
-                    )}
+                    <p className={`text-xs ${campaign?.status === "failed" ? "text-red-700" : "text-green-700"}`}>
+                      {campaign?.sentCount ?? 0} enviados, {campaign?.failedCount ?? 0} falhas
+                      {campaign?.sentAt ? ` - ${new Date(campaign.sentAt).toLocaleString("pt-BR")}` : ""}
+                    </p>
                   </div>
                 </div>
               </div>

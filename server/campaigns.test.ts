@@ -29,6 +29,7 @@ vi.mock("./db", () => {
     getCampaigns: vi.fn(async () => []),
     deleteCampaign: vi.fn(async () => {}),
     getCampaignAttachments: vi.fn(async () => []),
+    getCampaignAttachmentById: vi.fn(async () => ({ id: 1, campaignId: 1 })),
     addCampaignAttachment: vi.fn(async () => ({ id: 1 })),
     deleteCampaignAttachment: vi.fn(async () => {}),
     getContactListById: vi.fn(async (id: number) => ({ id, name: "Test List", contactCount: 5 })),
@@ -41,6 +42,7 @@ vi.mock("./db", () => {
     // Contact-related mocks
     createContact: vi.fn(async (data: any) => ({ id: nextId++ })),
     bulkCreateContacts: vi.fn(async (arr: any[]) => arr.map((_, i) => ({ id: i + 1 }))),
+    getAllUserContacts: vi.fn(async () => []),
     getContacts: vi.fn(async () => ({ contacts: [], total: 0 })),
     getContactById: vi.fn(async () => undefined),
     updateContact: vi.fn(async () => {}),
@@ -127,6 +129,60 @@ describe("Campaign Wizard Flow", () => {
 
     const campaign = db._getCampaigns().get(1);
     expect(campaign.listId).toBe(10);
+  });
+
+  it("requires a new test after changing the recipient list", async () => {
+    const caller = appRouter.createCaller(createAuthContext());
+    await caller.campaigns.create({ name: "Mudança de lista" });
+    const campaign = db._getCampaigns().get(1);
+    campaign.listId = 10;
+    campaign.subject = "Assunto";
+    campaign.subjectConfirmed = true;
+    campaign.status = "test_sent";
+    campaign.testSentAt = new Date();
+
+    await caller.campaigns.selectList({ campaignId: 1, listId: 20 });
+
+    expect(campaign.status).toBe("subject_confirmed");
+    expect(campaign.testSentAt).toBeNull();
+    await expect(caller.campaigns.sendCampaign({ campaignId: 1 })).rejects.toThrow("Envie um e-mail de teste");
+  });
+
+  it("rejects a second send while the first is preparing recipients", async () => {
+    const caller = appRouter.createCaller(createAuthContext());
+    await caller.campaigns.create({ name: "Envio único" });
+    const campaign = db._getCampaigns().get(1);
+    campaign.listId = 10;
+    campaign.status = "test_sent";
+    let releaseRecipients!: (contacts: any[]) => void;
+    vi.mocked(db.getListContacts).mockImplementationOnce(() => new Promise(resolve => {
+      releaseRecipients = resolve;
+    }));
+
+    const firstSend = caller.campaigns.sendCampaign({ campaignId: 1 });
+    await expect(caller.campaigns.sendCampaign({ campaignId: 1 })).rejects.toThrow("já está sendo enviada");
+    releaseRecipients([{ id: 1, email: "a@example.com", subscribed: true }]);
+    await expect(firstSend).rejects.toThrow("Configure as credenciais SMTP");
+    expect(campaign.status).toBe("test_sent");
+  });
+
+  it("invalidates the email test when an attachment changes", async () => {
+    const caller = appRouter.createCaller(createAuthContext());
+    await caller.campaigns.create({ name: "Teste de anexo" });
+    const campaign = db._getCampaigns().get(1);
+    campaign.status = "test_sent";
+    campaign.testSentAt = new Date();
+
+    await caller.campaigns.uploadAttachment({
+      campaignId: 1,
+      fileName: "arquivo.txt",
+      base64Data: Buffer.from("teste").toString("base64"),
+      mimeType: "text/plain",
+      fileSize: 5,
+    });
+
+    expect(campaign.status).toBe("content_ready");
+    expect(campaign.testSentAt).toBeNull();
   });
 
   it("should define subject for the campaign", async () => {

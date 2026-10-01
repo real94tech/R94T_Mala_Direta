@@ -113,16 +113,28 @@ async function xanoFetch(endpoint: string, method = 'GET', body?: any): Promise<
       body: body ? JSON.stringify(body) : undefined,
     };
     const response = await fetch(url, options);
-    const result = await response.json();
+    const result = await response.json().catch(() => null);
     if (!response.ok) {
       console.warn(`[Xano] ${method} ${endpoint} → ${response.status}`, result);
-      return { _error: true, status: response.status, ...result };
+      return { _error: true, status: response.status, ...(result && typeof result === 'object' ? result : {}) };
     }
     return result;
   } catch (error) {
     console.error(`[Xano] Falha de rede em ${endpoint}:`, error);
     return { _error: true };
   }
+}
+
+async function xanoChecked(endpoint: string, method = 'GET', body?: any): Promise<any> {
+  const result = await xanoFetch(endpoint, method, body);
+  if (result?._error) throw new Error(`Falha no Xano: ${method} ${endpoint} (${result.status ?? 'rede'}).`);
+  return result;
+}
+
+async function xanoArray(endpoint: string): Promise<any[]> {
+  const result = await xanoChecked(endpoint);
+  if (!Array.isArray(result)) throw new Error(`Resposta inválida do Xano: ${endpoint}.`);
+  return result;
 }
 
 // ============ USERS ============
@@ -251,37 +263,50 @@ function assertOwned(record: any, userId: number, entity: string) {
 
 // ============ CONTACT LISTS ============
 export async function createContactList(data: InsertContactList) {
-  const result = await xanoFetch('/mkt_contact_lists', 'POST', mapToXano({ ...data, contactCount: 0 }));
+  const result = await xanoChecked('/mkt_contact_lists', 'POST', mapToXano({ ...data, contactCount: 0 }));
+  if (!Number.isInteger(Number(result?.id)) || Number(result.id) <= 0) throw new Error('O Xano não retornou o ID da lista.');
   return { id: result.id };
+}
+
+function listContacts(members: any[], contacts: any[], listId: number, userId: number) {
+  const memberIds = new Set(members.filter(member => hasSameId(member.list_id, listId)).map(member => Number(member.contact_id)));
+  return contacts.filter(contact => memberIds.has(Number(contact.id)) && belongsToUser(contact, userId));
+}
+
+function listRecipients(members: any[], contacts: any[], listId: number, userId: number) {
+  const emails = new Set<string>();
+  return listContacts(members, contacts, listId, userId).filter(contact => {
+    if (!isSubscribed(contact.subscribed)) return false;
+    const email = normalizeEmail(contact.email);
+    if (!email || emails.has(email)) return false;
+    emails.add(email);
+    return true;
+  });
 }
 
 // 🔥 CONTAGEM DINÂMICA: Conta os contatos reais na hora que a tela carrega!
 export async function getContactLists(userId: number) {
-  const lists = await xanoFetch(`/mkt_contact_lists?user_id=${userId}`);
-  if (!Array.isArray(lists)) return [];
+  const [lists, allMembers, contacts] = await Promise.all([
+    xanoArray(`/mkt_contact_lists?user_id=${userId}`),
+    xanoArray('/mkt_contact_list_members'),
+    xanoArray(`/mkt_contacts?user_id=${userId}`),
+  ]);
   const ownedLists = lists.filter(list => belongsToUser(list, userId));
-
-  // Busca todos os membros de uma vez e distribui a contagem
-  const allMembers = await xanoFetch(`/mkt_contact_list_members`);
-  if (Array.isArray(allMembers)) {
-    ownedLists.forEach(list => {
-      // Conta na hora quantos contatos estão vinculados a esta lista
-      list.contactCount = allMembers.filter((m: any) => hasSameId(m.list_id, list.id)).length;
-    });
-  }
+  ownedLists.forEach(list => {
+    list.contactCount = listContacts(allMembers, contacts, Number(list.id), userId).length;
+  });
 
   return ownedLists.map(mapToApp);
 }
 
 export async function getContactListById(id: number, userId: number) {
-  const list = await xanoFetch(`/mkt_contact_lists/${id}`);
+  const list = await xanoChecked(`/mkt_contact_lists/${id}`);
   if (!list || list._error || !belongsToUser(list, userId)) return undefined;
-
-  // Conta os membros na hora para esta lista específica
-  const members = await xanoFetch(`/mkt_contact_list_members?list_id=${id}`);
-  if (Array.isArray(members)) {
-    list.contactCount = members.filter((m: any) => hasSameId(m.list_id, id)).length;
-  }
+  const [members, contacts] = await Promise.all([
+    xanoArray(`/mkt_contact_list_members?list_id=${id}`),
+    xanoArray(`/mkt_contacts?user_id=${userId}`),
+  ]);
+  list.contactCount = listContacts(members, contacts, id, userId).length;
 
   return mapToApp(list);
 }
@@ -290,49 +315,54 @@ export async function updateContactList(id: number, userId: number, data: Partia
   const existing = assertOwned(await xanoFetch(`/mkt_contact_lists/${id}`), userId, "Lista");
   const payload = { ...existing, ...mapToXano(data), mkt_contact_lists_id: id, user_id: userId };
   delete payload.created_at;
-  await xanoFetch(`/mkt_contact_lists/${id}`, 'PATCH', payload);
+  await xanoChecked(`/mkt_contact_lists/${id}`, 'PATCH', payload);
 }
 
 export async function deleteContactList(id: number, userId: number) {
   assertOwned(await xanoFetch(`/mkt_contact_lists/${id}`), userId, "Lista");
-  await xanoFetch(`/mkt_contact_lists/${id}`, 'DELETE');
+  await xanoChecked(`/mkt_contact_lists/${id}`, 'DELETE');
 }
 
 export async function recalcListCount(listId: number) {
-  try {
-    const members = await xanoFetch(`/mkt_contact_list_members?list_id=${listId}`);
-    const count = Array.isArray(members) ? members.filter((m: any) => hasSameId(m.list_id, listId)).length : 0;
-    
-    const existing = await xanoFetch(`/mkt_contact_lists/${listId}`);
-    if (existing && !existing._error) {
-      const payload = { ...existing, contactCount: count, mkt_contact_lists_id: listId };
-      delete payload.created_at;
-      await xanoFetch(`/mkt_contact_lists/${listId}`, 'PATCH', payload);
-    }
-  } catch (e) {}
+  const existing = await xanoChecked(`/mkt_contact_lists/${listId}`);
+  const userId = Number(existing.user_id ?? existing.userId);
+  const [members, contacts] = await Promise.all([
+    xanoArray(`/mkt_contact_list_members?list_id=${listId}`),
+    xanoArray(`/mkt_contacts?user_id=${userId}`),
+  ]);
+  const payload = { ...existing, contactCount: listContacts(members, contacts, listId, userId).length, mkt_contact_lists_id: listId };
+  delete payload.created_at;
+  await xanoChecked(`/mkt_contact_lists/${listId}`, 'PATCH', payload);
 }
 
 // ============ CONTACTS ============
 export async function createContact(data: InsertContact) {
-  const result = await xanoFetch('/mkt_contacts', 'POST', mapToXano({ ...data, subscribed: true }));
-  return { id: result.id || Math.floor(Math.random() * 1000) };
+  const result = await xanoChecked('/mkt_contacts', 'POST', mapToXano({ ...data, subscribed: true }));
+  if (!Number.isInteger(Number(result?.id)) || Number(result.id) <= 0) throw new Error('O Xano não retornou o ID do contato.');
+  return { id: Number(result.id) };
 }
 
 export async function bulkCreateContacts(dataArr: InsertContact[]) {
   if (dataArr.length === 0) return [];
   const results = await Promise.all(
-    dataArr.map(c => xanoFetch('/mkt_contacts', 'POST', mapToXano({ ...c, subscribed: true })))
+    dataArr.map(c => createContact(c))
   );
-  return results.filter(r => !r._error).map(r => ({ id: r.id }));
+  return results;
+}
+
+export async function getAllUserContacts(userId: number) {
+  const contacts = await xanoArray(`/mkt_contacts?user_id=${userId}`);
+  return contacts.filter(contact => belongsToUser(contact, userId)).map(mapToApp) as Contact[];
 }
 
 export async function getContacts(userId: number, opts?: { search?: string; listId?: number; page?: number; limit?: number }) {
-  let contacts = await xanoFetch(`/mkt_contacts?user_id=${userId}`);
-  if (!Array.isArray(contacts)) return { contacts: [], total: 0 };
+  let contacts = await xanoArray(`/mkt_contacts?user_id=${userId}`);
   contacts = contacts.filter(contact => belongsToUser(contact, userId));
 
-  if (opts?.listId) {
-    const members = await xanoFetch(`/mkt_contact_list_members?list_id=${opts.listId}`);
+  if (opts?.listId !== undefined) {
+    const list = await xanoChecked(`/mkt_contact_lists/${opts.listId}`);
+    assertOwned(list, userId, 'Lista');
+    const members = await xanoArray(`/mkt_contact_list_members?list_id=${opts.listId}`);
     const memberIds = new Set(
       Array.isArray(members)
         ? members
@@ -365,12 +395,12 @@ export async function updateContact(id: number, userId: number, data: Partial<In
   const existing = assertOwned(await xanoFetch(`/mkt_contacts/${id}`), userId, "Contato");
   const payload = { ...existing, ...mapToXano(data), mkt_contacts_id: id, user_id: userId };
   delete payload.created_at;
-  await xanoFetch(`/mkt_contacts/${id}`, 'PATCH', payload);
+  await xanoChecked(`/mkt_contacts/${id}`, 'PATCH', payload);
 }
 
 export async function deleteContact(id: number, userId: number) {
   assertOwned(await xanoFetch(`/mkt_contacts/${id}`), userId, "Contato");
-  await xanoFetch(`/mkt_contacts/${id}`, 'DELETE');
+  await xanoChecked(`/mkt_contacts/${id}`, 'DELETE');
 }
 
 // 🔥 ANTI-DUPLICIDADE: Verifica antes de adicionar para o Xano não bloquear
@@ -381,18 +411,13 @@ export async function addContactsToList(contactIds: number[], listId: number, us
   if (ownedContacts.some(contact => !contact)) throw new Error("Um ou mais contatos não pertencem ao usuário.");
   
   // 1. Busca quem já está na lista
-  const existingMembers = await xanoFetch(`/mkt_contact_list_members?list_id=${listId}`);
-  let idsToAdd = contactIds;
-  
-  if (Array.isArray(existingMembers)) {
-    const alreadyInList = new Set(existingMembers.map((m: any) => Number(m.contact_id)));
-    // 2. Filtra e só adiciona quem ainda NÃO está na lista
-    idsToAdd = contactIds.filter(id => !alreadyInList.has(Number(id)));
-  }
+  const existingMembers = await xanoArray(`/mkt_contact_list_members?list_id=${listId}`);
+  const alreadyInList = new Set(existingMembers.filter((m: any) => hasSameId(m.list_id, listId)).map((m: any) => Number(m.contact_id)));
+  const idsToAdd = Array.from(new Set(contactIds.map(Number))).filter(id => !alreadyInList.has(id));
 
   // 3. Adiciona os novos
   if (idsToAdd.length > 0) {
-    await Promise.all(idsToAdd.map(cid => xanoFetch('/mkt_contact_list_members', 'POST', { contact_id: cid, list_id: listId })));
+    await Promise.all(idsToAdd.map(cid => xanoChecked('/mkt_contact_list_members', 'POST', { contact_id: cid, list_id: listId })));
   }
   
   await recalcListCount(listId);
@@ -401,63 +426,46 @@ export async function addContactsToList(contactIds: number[], listId: number, us
 export async function removeContactFromList(contactId: number, listId: number, userId: number) {
   assertOwned(await xanoFetch(`/mkt_contact_lists/${listId}`), userId, "Lista");
   if (!await getContactById(contactId, userId)) throw new Error("Contato não encontrado ou sem permissão.");
-  const members = await xanoFetch(`/mkt_contact_list_members?list_id=${listId}`);
-  if (Array.isArray(members)) {
-    const target = members.find((m: any) => hasSameId(m.contact_id, contactId));
-    if (target) await xanoFetch(`/mkt_contact_list_members/${target.id}`, 'DELETE');
-  }
+  const members = await xanoArray(`/mkt_contact_list_members?list_id=${listId}`);
+  const targets = members.filter((m: any) => hasSameId(m.list_id, listId) && hasSameId(m.contact_id, contactId));
+  await Promise.all(targets.map(target => xanoChecked(`/mkt_contact_list_members/${target.id}`, 'DELETE')));
   await recalcListCount(listId);
 }
 
 export async function getContactListsForContact(contactId: number, userId: number) {
   if (!await getContactById(contactId, userId)) return [];
-  const members = await xanoFetch(`/mkt_contact_list_members?contact_id=${contactId}`);
-  if (!Array.isArray(members) || members.length === 0) return [];
-  const listIds = new Set(members.map((m: any) => Number(m.list_id)));
-  const allLists = await xanoFetch('/mkt_contact_lists');
-  return Array.isArray(allLists)
-    ? allLists.filter((l: any) => belongsToUser(l, userId) && listIds.has(Number(l.id))).map(mapToApp)
-    : [];
+  const members = await xanoArray(`/mkt_contact_list_members?contact_id=${contactId}`);
+  if (members.length === 0) return [];
+  const listIds = new Set(members.filter((m: any) => hasSameId(m.contact_id, contactId)).map((m: any) => Number(m.list_id)));
+  const allLists = await xanoArray('/mkt_contact_lists');
+  return allLists.filter((l: any) => belongsToUser(l, userId) && listIds.has(Number(l.id))).map(mapToApp);
 }
 
 export async function getListContacts(listId: number, userId: number) {
-  const list = await getContactListById(listId, userId);
-  if (!list) return [];
-  const members = await xanoFetch(`/mkt_contact_list_members?list_id=${listId}`);
-  if (!Array.isArray(members) || members.length === 0) return [];
-
-  // Endpoints genéricos do Xano podem ignorar query params e devolver todos os
-  // vínculos. Reaplicamos o filtro antes de montar os destinatários da campanha.
-  const contactIds = new Set(
-    members
-      .filter((member: any) => Number(member.list_id) === listId)
-      .map((member: any) => Number(member.contact_id))
-  );
-  if (contactIds.size === 0) return [];
-
-  const allContacts = await xanoFetch('/mkt_contacts');
-  return Array.isArray(allContacts)
-    ? allContacts
-        .filter((contact: any) => contactIds.has(Number(contact.id)) && belongsToUser(contact, userId) && isSubscribed(contact.subscribed))
-        .map(mapToApp)
-    : [];
+  assertOwned(await xanoChecked(`/mkt_contact_lists/${listId}`), userId, 'Lista');
+  const [members, contacts] = await Promise.all([
+    xanoArray(`/mkt_contact_list_members?list_id=${listId}`),
+    xanoArray(`/mkt_contacts?user_id=${userId}`),
+  ]);
+  return listRecipients(members, contacts, listId, userId).map(mapToApp);
 }
 
 // ============ CAMPAIGNS ============
 export async function createCampaign(data: InsertCampaign) {
-  const result = await xanoFetch('/mkt_campaigns', 'POST', mapToXano({
+  const result = await xanoChecked('/mkt_campaigns', 'POST', mapToXano({
     ...data, status: data.status || 'draft', subjectConfirmed: false
   }));
-  return { id: result.id || Math.floor(Math.random() * 1000) };
+  if (!Number.isInteger(Number(result?.id)) || Number(result.id) <= 0) throw new Error('O Xano não retornou o ID da campanha.');
+  return { id: Number(result.id) };
 }
 
 export async function getCampaigns(userId: number) {
-  const data = await xanoFetch(`/mkt_campaigns?user_id=${userId}`);
-  return Array.isArray(data) ? data.filter(item => belongsToUser(item, userId)).map(mapToApp) : [];
+  const data = await xanoArray(`/mkt_campaigns?user_id=${userId}`);
+  return data.filter(item => belongsToUser(item, userId)).map(mapToApp);
 }
 
 export async function getCampaignById(id: number, userId: number) {
-  const result = await xanoFetch(`/mkt_campaigns/${id}`);
+  const result = await xanoChecked(`/mkt_campaigns/${id}`);
   return result && !result._error && belongsToUser(result, userId) ? mapToApp(result) : undefined;
 }
 
@@ -466,35 +474,37 @@ export async function updateCampaign(id: number, userId: number, data: Partial<I
   const payload = { ...existing, ...mapToXano(data), mkt_campaigns_id: id, user_id: userId };
   delete payload.created_at;
 
-  const res = await xanoFetch(`/mkt_campaigns/${id}`, 'PATCH', payload);
-  if (res._error) throw new Error("Erro ao salvar no Xano");
+  await xanoChecked(`/mkt_campaigns/${id}`, 'PATCH', payload);
 }
 
 export async function deleteCampaign(id: number, userId: number) {
   assertOwned(await xanoFetch(`/mkt_campaigns/${id}`), userId, "Campanha");
-  await xanoFetch(`/mkt_campaigns/${id}`, 'DELETE');
+  await xanoChecked(`/mkt_campaigns/${id}`, 'DELETE');
 }
 
 export async function getCampaignAttachments(campaignId: number, userId: number) {
   if (!await getCampaignById(campaignId, userId)) return [];
-  const data = await xanoFetch(`/mkt_campaign_attachments?campaigns_id=${campaignId}`);
-  return Array.isArray(data)
-    ? data.filter(item => Number(item.campaigns_id ?? item.campaign_id) === campaignId).map(mapToApp)
-    : [];
+  const data = await xanoArray(`/mkt_campaign_attachments?campaigns_id=${campaignId}`);
+  return data.filter(item => Number(item.campaigns_id ?? item.campaign_id) === campaignId).map(mapToApp);
 }
 
 export async function addCampaignAttachment(data: any) {
-  const result = await xanoFetch('/mkt_campaign_attachments', 'POST', mapToXano(data));
+  const result = await xanoChecked('/mkt_campaign_attachments', 'POST', mapToXano(data));
   return { id: result.id };
 }
 
-export async function deleteCampaignAttachment(id: number, userId: number) {
-  const attachment = await xanoFetch(`/mkt_campaign_attachments/${id}`);
+export async function getCampaignAttachmentById(id: number, userId: number) {
+  const attachment = await xanoChecked(`/mkt_campaign_attachments/${id}`);
   const campaignId = Number(attachment?.campaigns_id ?? attachment?.campaign_id);
   if (!campaignId || !await getCampaignById(campaignId, userId)) {
     throw new Error("Anexo não encontrado ou sem permissão.");
   }
-  await xanoFetch(`/mkt_campaign_attachments/${id}`, 'DELETE');
+  return { ...mapToApp(attachment), campaignId };
+}
+
+export async function deleteCampaignAttachment(id: number, userId: number) {
+  await getCampaignAttachmentById(id, userId);
+  await xanoChecked(`/mkt_campaign_attachments/${id}`, 'DELETE');
 }
 
 // ============ AUDIT LOGS E SMTP ============
@@ -503,15 +513,14 @@ export async function createAuditLog(data: InsertAuditLog) {
 }
 
 export async function getAuditLogs(userId: number, opts?: { page?: number; limit?: number; entityType?: string }) {
-  let logs = await xanoFetch(`/mkt_audit_logs?user_id=${userId}`);
-  if (!Array.isArray(logs)) return { logs: [], total: 0 };
+  let logs = await xanoArray(`/mkt_audit_logs?user_id=${userId}`);
   logs = logs.filter(log => belongsToUser(log, userId));
   if (opts?.entityType) logs = logs.filter((l: any) => l.entityType === opts.entityType);
   return { logs: logs.slice(0, opts?.limit ?? 50).map(mapToApp), total: logs.length };
 }
 
 export async function getSmtpSettings(userId: number) {
-  const data = await xanoFetch(`/mkt_smtp_settings?user_id=${userId}`);
+  const data = await xanoChecked(`/mkt_smtp_settings?user_id=${userId}`);
   const settings = Array.isArray(data)
     ? data.find(item => belongsToUser(item, userId))
     : (!data?._error && belongsToUser(data, userId) ? data : undefined);
@@ -521,27 +530,28 @@ export async function getSmtpSettings(userId: number) {
 export async function upsertSmtpSettings(userId: number, data: Omit<InsertSmtpSettings, 'userId'>) {
   const existing = await getSmtpSettings(userId);
   if (existing?.id) {
-    const raw = await xanoFetch(`/mkt_smtp_settings/${existing.id}`);
+    const raw = await xanoChecked(`/mkt_smtp_settings/${existing.id}`);
     const payload = { ...raw, ...mapToXano(data), mkt_smtp_settings_id: existing.id, user_id: userId, isActive: true };
     delete payload.created_at;
-    await xanoFetch(`/mkt_smtp_settings/${existing.id}`, 'PATCH', payload);
+    await xanoChecked(`/mkt_smtp_settings/${existing.id}`, 'PATCH', payload);
     return { id: existing.id };
   }
-  const result = await xanoFetch('/mkt_smtp_settings', 'POST', mapToXano({ ...data, user_id: userId, isActive: true }));
+  const result = await xanoChecked('/mkt_smtp_settings', 'POST', mapToXano({ ...data, user_id: userId, isActive: true }));
+  if (!Number.isInteger(Number(result?.id)) || Number(result.id) <= 0) throw new Error('O Xano não retornou o ID das configurações SMTP.');
   return { id: result.id };
 }
 
 // ============ DASHBOARD STATS ============
 export async function getDashboardStats(userId: number) {
   const [contacts, lists, campaigns] = await Promise.all([
-    xanoFetch(`/mkt_contacts?user_id=${userId}`),
-    xanoFetch(`/mkt_contact_lists?user_id=${userId}`),
-    xanoFetch(`/mkt_campaigns?user_id=${userId}`),
+    xanoArray(`/mkt_contacts?user_id=${userId}`),
+    xanoArray(`/mkt_contact_lists?user_id=${userId}`),
+    xanoArray(`/mkt_campaigns?user_id=${userId}`),
   ]);
 
-  const ownedContacts = Array.isArray(contacts) ? contacts.filter(item => belongsToUser(item, userId)) : [];
-  const ownedLists = Array.isArray(lists) ? lists.filter(item => belongsToUser(item, userId)) : [];
-  const ownedCampaigns = Array.isArray(campaigns) ? campaigns.filter(item => belongsToUser(item, userId)) : [];
+  const ownedContacts = contacts.filter(item => belongsToUser(item, userId));
+  const ownedLists = lists.filter(item => belongsToUser(item, userId));
+  const ownedCampaigns = campaigns.filter(item => belongsToUser(item, userId));
   return {
     totalContacts: ownedContacts.length,
     totalLists: ownedLists.length,

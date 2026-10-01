@@ -4,12 +4,14 @@ import type { TrpcContext } from "./_core/context";
 
 // Mock db module
 vi.mock("./db", () => ({
-  bulkCreateContacts: vi.fn().mockImplementation((arr: any[]) =>
-    arr.map((_, i) => ({ id: i + 1 }))
-  ),
+  getAllUserContacts: vi.fn().mockResolvedValue([]),
+  getContactListById: vi.fn().mockResolvedValue({ id: 5, userId: 1 }),
+  createContact: vi.fn().mockImplementation(async () => ({ id: nextContactId++ })),
   addContactsToList: vi.fn().mockResolvedValue(undefined),
   createAuditLog: vi.fn().mockResolvedValue(undefined),
 }));
+
+let nextContactId = 1;
 
 function createAuthContext(): TrpcContext {
   return {
@@ -32,6 +34,7 @@ function createAuthContext(): TrpcContext {
 describe("contacts.quickImport", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    nextContactId = 1;
   });
 
   it("imports a single email without header", async () => {
@@ -131,9 +134,42 @@ describe("contacts.quickImport", () => {
     expect(addContactsToList).toHaveBeenCalledWith([1, 2], 5, 1);
   });
 
+  it("reuses an existing contact and skips duplicate rows", async () => {
+    const { createContact, getAllUserContacts, addContactsToList } = await import("./db");
+    vi.mocked(getAllUserContacts).mockResolvedValueOnce([
+      { id: 42, email: "known@example.com" },
+    ] as any);
+    const caller = appRouter.createCaller(createAuthContext());
+
+    const result = await caller.contacts.quickImport({
+      rawText: "known@example.com\nnew@example.com\nNEW@example.com",
+      listId: 5,
+    });
+
+    expect(result.imported).toBe(1);
+    expect(result.linked).toBe(2);
+    expect(createContact).toHaveBeenCalledTimes(1);
+    expect(addContactsToList).toHaveBeenCalledWith([42, 1], 5, 1);
+  });
+
   it("throws error for empty input", async () => {
     const ctx = createAuthContext();
     const caller = appRouter.createCaller(ctx);
     await expect(caller.contacts.quickImport({ rawText: "" })).rejects.toThrow();
+  });
+});
+
+describe("contacts.create", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("refuses a second contact with the same email for the user", async () => {
+    const { createContact, getAllUserContacts } = await import("./db");
+    vi.mocked(getAllUserContacts).mockResolvedValueOnce([{ id: 42, email: "known@example.com" }] as any);
+    const caller = appRouter.createCaller(createAuthContext());
+
+    await expect(caller.contacts.create({ email: "KNOWN@example.com" })).rejects.toThrow("já está cadastrado");
+    expect(createContact).not.toHaveBeenCalled();
   });
 });
