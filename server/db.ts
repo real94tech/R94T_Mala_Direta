@@ -334,7 +334,11 @@ export async function getContacts(userId: number, opts?: { search?: string; list
   if (opts?.listId) {
     const members = await xanoFetch(`/mkt_contact_list_members?list_id=${opts.listId}`);
     const memberIds = new Set(
-      Array.isArray(members) ? members.map((m: any) => Number(m.contact_id)) : []
+      Array.isArray(members)
+        ? members
+            .filter((member: any) => hasSameId(member.list_id, opts.listId))
+            .map((member: any) => Number(member.contact_id))
+        : []
     );
     contacts = contacts.filter((c: any) => memberIds.has(Number(c.id)));
   }

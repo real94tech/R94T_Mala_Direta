@@ -19,6 +19,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
 import { Plus, Upload, Search, Trash2, Edit, ChevronLeft, ChevronRight, Users, ClipboardPaste, FileSpreadsheet, CheckCircle2, AlertCircle, FileUp, File } from "lucide-react";
 import * as XLSX from "xlsx";
+import { useLocation } from "wouter";
 
 type ContactRow = {
   id: number;
@@ -32,15 +33,21 @@ type ContactRow = {
 };
 
 export default function Contacts() {
+  const [location, setLocation] = useLocation();
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState("");
-  const [selectedList, setSelectedList] = useState<string>("all");
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [showImportDialog, setShowImportDialog] = useState(false);
   const [showEditDialog, setShowEditDialog] = useState(false);
   const [editContact, setEditContact] = useState<any>(null);
 
-  const listIdFilter = selectedList !== "all" ? parseInt(selectedList) : undefined;
+  const selectedList = new URLSearchParams(location.split("?")[1] ?? "").get("list") ?? "all";
+  const listIdFilter = selectedList !== "all" ? Number(selectedList) : undefined;
+
+  const handleListChange = (listId: string) => {
+    setPage(1);
+    setLocation(listId === "all" ? "/contacts" : `/contacts?list=${encodeURIComponent(listId)}`);
+  };
 
   const { data, isLoading } = trpc.contacts.list.useQuery({
     page, limit: 20, search: search || undefined, listId: listIdFilter,
@@ -103,7 +110,7 @@ export default function Contacts() {
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
               <Input placeholder="Pesquisar contatos..." value={search} onChange={(e) => { setSearch(e.target.value); setPage(1); }} className="pl-9" />
             </div>
-            <Select value={selectedList} onValueChange={(v) => { setSelectedList(v); setPage(1); }}>
+            <Select value={selectedList} onValueChange={handleListChange}>
               <SelectTrigger className="w-48"><SelectValue placeholder="Filtrar por lista" /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">Todos os contatos</SelectItem>
