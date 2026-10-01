@@ -38,10 +38,16 @@ export default function Login() {
         credentials: "include",
       });
 
-      const data = await res.json();
+      const responseText = await res.text();
+      let data: { error?: string } = {};
+      try {
+        data = responseText ? JSON.parse(responseText) : {};
+      } catch {
+        // Proxies may return an HTML error page instead of the API response.
+      }
 
       if (!res.ok) {
-        setError(data.error || "Erro ao fazer login.");
+        setError(data.error || `Não foi possível acessar a autenticação (HTTP ${res.status}).`);
         return;
       }
 
@@ -135,14 +141,9 @@ export default function Login() {
               </Button>
             </form>
 
-            <div className="mt-6 pt-4 border-t border-gray-100">
-              <p className="text-xs text-center text-gray-400">
-                Primeiro acesso? Execute no terminal do servidor:
-              </p>
-              <pre className="mt-2 text-xs bg-gray-50 rounded p-2 text-gray-600 overflow-x-auto">
-                node scripts/create-admin.mjs
-              </pre>
-            </div>
+            <p className="mt-6 pt-4 border-t border-gray-100 text-xs text-center text-gray-400">
+              As credenciais de acesso são gerenciadas no Xano.
+            </p>
           </CardContent>
         </Card>
       </div>

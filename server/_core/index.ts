@@ -38,6 +38,9 @@ async function startServer() {
   registerOAuthRoutes(app);
   // Local email/password auth routes (for running outside Manus)
   registerLocalAuthRoutes(app);
+  app.get("/api/health", (_req, res) => {
+    res.json({ ok: true, service: "mala-direta" });
+  });
   // tRPC API
   app.use(
     "/api/trpc",

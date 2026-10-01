@@ -236,6 +236,12 @@ function isSubscribed(value: unknown) {
   return value === true || value === 1 || value === "1" || value === "true";
 }
 
+function hasSameId(left: unknown, right: unknown) {
+  const normalizedLeft = Number(left);
+  const normalizedRight = Number(right);
+  return Number.isFinite(normalizedLeft) && normalizedLeft === normalizedRight;
+}
+
 function assertOwned(record: any, userId: number, entity: string) {
   if (!record || record._error || !belongsToUser(record, userId)) {
     throw new Error(`${entity} não encontrado ou sem permissão.`);
@@ -260,7 +266,7 @@ export async function getContactLists(userId: number) {
   if (Array.isArray(allMembers)) {
     ownedLists.forEach(list => {
       // Conta na hora quantos contatos estão vinculados a esta lista
-      list.contactCount = allMembers.filter((m: any) => m.list_id === list.id).length;
+      list.contactCount = allMembers.filter((m: any) => hasSameId(m.list_id, list.id)).length;
     });
   }
 
@@ -274,7 +280,7 @@ export async function getContactListById(id: number, userId: number) {
   // Conta os membros na hora para esta lista específica
   const members = await xanoFetch(`/mkt_contact_list_members?list_id=${id}`);
   if (Array.isArray(members)) {
-    list.contactCount = members.filter((m: any) => m.list_id == id).length;
+    list.contactCount = members.filter((m: any) => hasSameId(m.list_id, id)).length;
   }
 
   return mapToApp(list);
@@ -295,7 +301,7 @@ export async function deleteContactList(id: number, userId: number) {
 export async function recalcListCount(listId: number) {
   try {
     const members = await xanoFetch(`/mkt_contact_list_members?list_id=${listId}`);
-    const count = Array.isArray(members) ? members.filter((m: any) => m.list_id == listId).length : 0;
+    const count = Array.isArray(members) ? members.filter((m: any) => hasSameId(m.list_id, listId)).length : 0;
     
     const existing = await xanoFetch(`/mkt_contact_lists/${listId}`);
     if (existing && !existing._error) {
@@ -327,8 +333,10 @@ export async function getContacts(userId: number, opts?: { search?: string; list
 
   if (opts?.listId) {
     const members = await xanoFetch(`/mkt_contact_list_members?list_id=${opts.listId}`);
-    const memberIds = Array.isArray(members) ? members.map((m: any) => m.contact_id) : [];
-    contacts = contacts.filter((c: any) => memberIds.includes(c.id));
+    const memberIds = new Set(
+      Array.isArray(members) ? members.map((m: any) => Number(m.contact_id)) : []
+    );
+    contacts = contacts.filter((c: any) => memberIds.has(Number(c.id)));
   }
 
   if (opts?.search) {
@@ -373,9 +381,9 @@ export async function addContactsToList(contactIds: number[], listId: number, us
   let idsToAdd = contactIds;
   
   if (Array.isArray(existingMembers)) {
-    const alreadyInList = new Set(existingMembers.map((m: any) => m.contact_id));
+    const alreadyInList = new Set(existingMembers.map((m: any) => Number(m.contact_id)));
     // 2. Filtra e só adiciona quem ainda NÃO está na lista
-    idsToAdd = contactIds.filter(id => !alreadyInList.has(id));
+    idsToAdd = contactIds.filter(id => !alreadyInList.has(Number(id)));
   }
 
   // 3. Adiciona os novos
@@ -391,7 +399,7 @@ export async function removeContactFromList(contactId: number, listId: number, u
   if (!await getContactById(contactId, userId)) throw new Error("Contato não encontrado ou sem permissão.");
   const members = await xanoFetch(`/mkt_contact_list_members?list_id=${listId}`);
   if (Array.isArray(members)) {
-    const target = members.find((m: any) => m.contact_id === contactId);
+    const target = members.find((m: any) => hasSameId(m.contact_id, contactId));
     if (target) await xanoFetch(`/mkt_contact_list_members/${target.id}`, 'DELETE');
   }
   await recalcListCount(listId);
@@ -401,10 +409,10 @@ export async function getContactListsForContact(contactId: number, userId: numbe
   if (!await getContactById(contactId, userId)) return [];
   const members = await xanoFetch(`/mkt_contact_list_members?contact_id=${contactId}`);
   if (!Array.isArray(members) || members.length === 0) return [];
-  const listIds = members.map((m: any) => m.list_id);
+  const listIds = new Set(members.map((m: any) => Number(m.list_id)));
   const allLists = await xanoFetch('/mkt_contact_lists');
   return Array.isArray(allLists)
-    ? allLists.filter((l: any) => belongsToUser(l, userId) && listIds.includes(l.id)).map(mapToApp)
+    ? allLists.filter((l: any) => belongsToUser(l, userId) && listIds.has(Number(l.id))).map(mapToApp)
     : [];
 }
 

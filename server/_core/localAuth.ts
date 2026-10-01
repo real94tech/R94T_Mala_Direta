@@ -33,6 +33,13 @@ function getXanoUserId(user: any) {
   return Number.isFinite(id) && id > 0 ? id : null;
 }
 
+function isInvalidXanoCredentials(error: any) {
+  const status = error?.response?.status;
+  const message = String(error?.response?.data?.message ?? error?.message ?? "");
+  // This Xano workspace reports invalid credentials as ERROR_FATAL/500.
+  return status === 401 || status === 403 || /invalid credentials/i.test(message);
+}
+
 export async function createLocalSessionToken(openId: string, name: string): Promise<string> {
   const expiresAt = Math.floor((Date.now() + ONE_YEAR_MS) / 1000);
   return new SignJWT({ openId, appId: ENV.appId || "local", name })
@@ -93,7 +100,7 @@ export function registerLocalAuthRoutes(app: Express) {
       const xanoToken = getXanoToken(loginResponse);
       if (!xanoToken) {
         console.error("[XanoAuth] Login sem token de autenticação na resposta.");
-        res.status(502).json({ error: "O Xano não retornou um token de sessão." });
+        res.status(500).json({ error: "O Xano não retornou um token de sessão." });
         return;
       }
 
@@ -101,7 +108,7 @@ export function registerLocalAuthRoutes(app: Express) {
       const xanoUserId = getXanoUserId(xanoUser);
       if (!xanoUserId) {
         console.error("[XanoAuth] Usuário autenticado sem id na resposta.");
-        res.status(502).json({ error: "O Xano não retornou os dados do usuário." });
+        res.status(500).json({ error: "O Xano não retornou os dados do usuário." });
         return;
       }
 
@@ -127,12 +134,12 @@ export function registerLocalAuthRoutes(app: Express) {
         },
       });
     } catch (error: any) {
-      if (error?.response?.status === 401 || error?.response?.status === 403) {
+      if (isInvalidXanoCredentials(error)) {
         res.status(401).json({ error: "Email ou senha incorretos." });
         return;
       }
       console.error("[LocalAuth] Login error:", error);
-      res.status(502).json({ error: "Não foi possível autenticar no Xano." });
+      res.status(500).json({ error: "Não foi possível autenticar no Xano." });
     }
   });
 

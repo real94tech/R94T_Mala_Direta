@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getListContacts } from "./db";
+import { getContactLists, getListContacts } from "./db";
 
 function xanoResponse(data: unknown) {
   return {
@@ -34,5 +34,33 @@ describe("getListContacts", () => {
     const recipients = await getListContacts(10, 7);
 
     expect(recipients.map(contact => contact.email)).toEqual(["selected@example.com"]);
+  });
+});
+
+describe("getContactLists", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("counts members when Xano returns relation ids as strings", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(xanoResponse([
+        { id: 10, user_id: 7, name: "Clientes" },
+        { id: 20, user_id: 7, name: "Fornecedores" },
+      ]))
+      .mockResolvedValueOnce(xanoResponse([
+        { id: 1, list_id: "10", contact_id: "101" },
+        { id: 2, list_id: "10", contact_id: "102" },
+        { id: 3, list_id: "20", contact_id: "201" },
+      ]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const lists = await getContactLists(7);
+
+    expect(lists.map(list => [list.name, list.contactCount])).toEqual([
+      ["Clientes", 2],
+      ["Fornecedores", 1],
+    ]);
   });
 });
