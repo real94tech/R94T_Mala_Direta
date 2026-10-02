@@ -15,6 +15,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
 import { Plus, Upload, Search, Trash2, Edit, ChevronLeft, ChevronRight, Users, ClipboardPaste, FileSpreadsheet, CheckCircle2, AlertCircle, FileUp, File } from "lucide-react";
@@ -39,6 +40,7 @@ export default function Contacts() {
   const [search, setSearch] = useState("");
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [showImportDialog, setShowImportDialog] = useState(false);
+  const [showLinkDialog, setShowLinkDialog] = useState(false);
   const [showEditDialog, setShowEditDialog] = useState(false);
   const [editContact, setEditContact] = useState<any>(null);
 
@@ -57,8 +59,18 @@ export default function Contacts() {
     page, limit: 20, search: search || undefined, listId: listIdFilter,
   });
   const { data: lists } = trpc.lists.list.useQuery();
+  const selectedListName = lists?.find(list => list.id === listIdFilter)?.name;
   const utils = trpc.useUtils();
-  const addToListMutation = trpc.contacts.addToList.useMutation();
+  const addToListMutation = trpc.contacts.addToList.useMutation({
+    onSuccess: () => {
+      toast.success("Contatos vinculados à lista");
+      setShowLinkDialog(false);
+      utils.contacts.list.invalidate();
+      utils.lists.list.invalidate();
+      utils.dashboard.stats.invalidate();
+    },
+    onError: (err) => toast.error(err.message),
+  });
 
   const createMutation = trpc.contacts.create.useMutation({
     onSuccess: async (result) => {
@@ -116,9 +128,16 @@ export default function Contacts() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Contatos</h1>
-          <p className="text-muted-foreground text-sm mt-1">Gerencie seus contatos de e-mail marketing.</p>
+          <p className="text-muted-foreground text-sm mt-1">
+            {listIdFilter ? `Lista: ${selectedListName ?? `#${listIdFilter}`}. Apenas membros desta lista aparecem abaixo.` : "Gerencie seus contatos de e-mail marketing."}
+          </p>
         </div>
         <div className="flex gap-2">
+          {listIdFilter && (
+            <Button variant="outline" onClick={() => setShowLinkDialog(true)} className="gap-2">
+              <Users className="h-4 w-4" /> Vincular contatos existentes
+            </Button>
+          )}
           <Button variant="outline" onClick={() => setShowImportDialog(true)} className="gap-2">
             <Upload className="h-4 w-4" /> Importar contatos
           </Button>
@@ -168,7 +187,8 @@ export default function Contacts() {
                     <TableCell colSpan={7} className="text-center py-12">
                       <div className="flex flex-col items-center gap-3">
                         <Users className="h-10 w-10 text-muted-foreground/50" />
-                        <p className="text-muted-foreground">Nenhum contato encontrado</p>
+                        <p className="text-muted-foreground">{listIdFilter ? "Nenhum contato vinculado a esta lista" : "Nenhum contato encontrado"}</p>
+                        {listIdFilter && <Button variant="outline" size="sm" onClick={() => setShowLinkDialog(true)}>Vincular contatos existentes</Button>}
                         <Button variant="outline" size="sm" onClick={() => setShowImportDialog(true)}>Importar contatos</Button>
                       </div>
                     </TableCell>
@@ -221,7 +241,96 @@ export default function Contacts() {
       <AddContactDialog open={showAddDialog} onOpenChange={setShowAddDialog} onSubmit={(data) => createMutation.mutate(data)} isLoading={createMutation.isPending} />
       {editContact && <EditContactDialog open={showEditDialog} onOpenChange={setShowEditDialog} contact={editContact} onSubmit={(data) => updateMutation.mutate({ id: editContact.id, ...data })} isLoading={updateMutation.isPending} />}
       <QuickImportDialog open={showImportDialog} onOpenChange={setShowImportDialog} initialListId={selectedList} lists={lists || []} onSubmit={(data) => importMutation.mutate(data)} isLoading={importMutation.isPending} />
+      {listIdFilter && (
+        <LinkContactsDialog
+          key={listIdFilter}
+          open={showLinkDialog}
+          onOpenChange={setShowLinkDialog}
+          listName={selectedListName ?? `#${listIdFilter}`}
+          onSubmit={(contactIds) => addToListMutation.mutate({ contactIds, listId: listIdFilter })}
+          isLoading={addToListMutation.isPending}
+        />
+      )}
     </div>
+  );
+}
+
+function LinkContactsDialog({ open, onOpenChange, listName, onSubmit, isLoading }: {
+  open: boolean;
+  onOpenChange: (value: boolean) => void;
+  listName: string;
+  onSubmit: (contactIds: number[]) => void;
+  isLoading: boolean;
+}) {
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const { data, isLoading: isLoadingContacts } = trpc.contacts.list.useQuery(
+    { page, limit: 20, search: search || undefined },
+    { enabled: open },
+  );
+
+  useEffect(() => {
+    if (!open) {
+      setSearch("");
+      setPage(1);
+      setSelectedIds(new Set());
+    }
+  }, [open]);
+
+  const toggleContact = (id: number) => {
+    setSelectedIds(current => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>Vincular contatos existentes</DialogTitle>
+          <DialogDescription>Selecione somente os contatos que devem entrar na lista "{listName}".</DialogDescription>
+        </DialogHeader>
+        <Input
+          placeholder="Buscar por nome ou e-mail"
+          value={search}
+          onChange={(event) => { setSearch(event.target.value); setPage(1); }}
+        />
+        <div className="max-h-72 overflow-y-auto rounded-md border">
+          {isLoadingContacts ? (
+            <p className="p-4 text-sm text-muted-foreground">Carregando contatos...</p>
+          ) : data?.contacts.length ? data.contacts.map(contact => (
+            <label key={contact.id} className="flex cursor-pointer items-center gap-3 border-b p-3 last:border-0">
+              <Checkbox checked={selectedIds.has(contact.id)} onCheckedChange={() => toggleContact(contact.id)} />
+              <span className="min-w-0 text-sm">
+                <span className="block font-medium">{[contact.firstName, contact.lastName].filter(Boolean).join(" ") || contact.email}</span>
+                <span className="block truncate text-muted-foreground">{contact.email}</span>
+              </span>
+            </label>
+          )) : (
+            <p className="p-4 text-sm text-muted-foreground">Nenhum contato encontrado.</p>
+          )}
+        </div>
+        {(data?.total ?? 0) > 20 && (
+          <div className="flex items-center justify-between text-sm">
+            <span>Página {page} de {Math.ceil((data?.total ?? 0) / 20)}</span>
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" disabled={page === 1} onClick={() => setPage(value => value - 1)}>Anterior</Button>
+              <Button variant="outline" size="sm" disabled={page * 20 >= (data?.total ?? 0)} onClick={() => setPage(value => value + 1)}>Próxima</Button>
+            </div>
+          </div>
+        )}
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>Cancelar</Button>
+          <Button disabled={selectedIds.size === 0 || isLoading} onClick={() => onSubmit(Array.from(selectedIds))}>
+            {isLoading ? "Vinculando..." : `Vincular ${selectedIds.size} contato(s)`}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
